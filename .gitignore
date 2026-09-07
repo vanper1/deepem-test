@@ -1,0 +1,70 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+.myenv/
+venv/
+env/
+ENV/
+
+# Local environment files
+.env
+.env.*
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+.eggs/
+
+# Test / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# Logs
+*.log
+run.log
+vllm.log
+
+# Debug / local runtime files
+deepem_debug_logs/
+*.sqlite3
+*.db
+*.pid
+
+# IDE / editor
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+
+# Swap / temp
+*.swp
+*.swo
+*~
+main/data
+
+# SQLite 运行期产物（-shm/-wal 不在上面的 *.sqlite3 规则内）
+*.sqlite3-shm
+*.sqlite3-wal
+
+# 随项目分发的 NL2SQL 查表示例库保留这一份（不被上面的 *.db 误伤）
+!data/nl2sql_demo.db
+
+# 编辑器/人工备份副本（如 "server copy.py"）
+* copy.*

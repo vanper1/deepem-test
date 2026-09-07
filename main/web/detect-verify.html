@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeepEM 智能检测</title>
+  <link rel="stylesheet" href="/static/styles.css?v=probe-agent-20260729">
+</head>
+<body class="deem-body">
+<div class="deem-app">
+
+  <header class="deem-header">
+    <div class="deem-brandline"><span class="deem-mini-logo">EM</span><span class="deem-brand-title">DeepEM 智能电磁检测平台</span></div>
+    <div class="deem-page-title"><h1>DeepEM 智能检测</h1><div class="org">中国科学院信息工程研究所</div></div>
+    <div class="deem-header-actions"><a class="deem-btn ghost" href="/detect/new">返回任务配置</a></div>
+  </header>
+  <main class="deem-main">
+
+<section class="deem-check-layout detect-device-layout">
+  <section class="deem-panel strong">
+    <div class="deem-panel-title"><h2 id="verifyTaskName">调用设备平台接口</h2><span class="hint"></span></div>
+    <div id="deviceStatusSummary" class="deem-report-box compact">正在调用设备平台接口……</div>
+    <div id="deviceListPane" class="detect-device-list"><div class="deem-step"><span class="dot"></span><p>正在扫描设备并读取能力范围。</p></div></div>
+    <div id="deviceParamPane" class="deem-report-box compact"></div>
+  </section>
+  <section class="deem-panel deem-resource-card">
+    <div class="deem-checkmark">↻</div>
+    <h2 id="deviceReadyTitle">等待选择设备</h2>
+    <p id="deviceReadyText">选择设备后点击开始执行</p>
+    
+    <div class="detect-verify-actions"
+        style="display:flex;flex-direction:column;gap:20px;">
+
+        <!-- 第一行：模式选择 -->
+        <div class="detect-reasoning-mode"
+            role="radiogroup"
+            aria-label="采集智能体模式"
+            style="display:flex;justify-content:center;gap:28px;">
+
+            <label>
+                <input type="radio" name="reasoningMode" value="fast">
+                <span>
+                    <strong>快速模式</strong>
+                    <small></small>
+                </span>
+            </label>
+
+            <label>
+                <input type="radio"
+                      name="reasoningMode"
+                      value="deep"
+                      checked>
+                <span>
+                    <strong>深度思考模式</strong>
+                    <small></small>
+                </span>
+            </label>
+
+        </div>
+
+        <!-- 第二行：按钮 -->
+        <div style="display:flex;
+                    justify-content:space-between;
+                    align-items:center;
+                    width:100%;">
+
+            <a class="deem-btn ghost"
+              href="/detect/new">
+                返回
+            </a>
+
+            <button id="startDetectBtn"
+                    class="deem-btn primary"
+                    type="button"
+                    disabled>
+                开始执行
+            </button>
+
+        </div>
+
+    </div>
+
+
+
+  </section>
+</section>
+  </main>
+  <div class="deem-footer-org">中国科学院信息工程研究所</div>
+</div>
+<script src="/static/js/portal.js?v=probe-agent-20260729"></script>
+</body>
+</html>

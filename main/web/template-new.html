@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeepEM 检测模板管理</title>
+  <link rel="stylesheet" href="/static/styles.css?v=real-data-20260729">
+</head>
+<body class="deem-body">
+<div class="deem-app">
+
+  <header class="deem-header">
+    <div class="deem-brandline"><span class="deem-mini-logo">EM</span><span class="deem-brand-title">DeepEM 智能电磁检测平台</span></div>
+    <div class="deem-page-title"><h1>DeepEM 检测模板管理</h1><div class="org">中国科学院信息工程研究所</div></div>
+    <div class="deem-header-actions"><a class="deem-btn ghost" href="/templates">返回</a></div>
+  </header>
+  <main class="deem-main">
+
+<section class="deem-form-grid">
+  <section class="deem-panel strong">
+    <div class="deem-panel-title"><h2>新建检测模板</h2><a class="deem-btn ghost" href="/templates">返回</a></div>
+    <div class="deem-form-section">
+      <label class="deem-field"><span>模板名称：</span><input id="newTemplateName" class="deem-input" placeholder="默认使用 DOCX 文件名"></label>
+      <label class="deem-field"><span>适用场景：</span><input id="newTemplateScene" class="deem-input" value="会议室、机房、实验室"></label>
+      <label class="deem-field"><span>操作员：</span><input id="newTemplateOperator" class="deem-input" value="operator"></label>
+      <label class="deem-field"><span>模板文档：</span><input id="templateDocxFile" class="deem-input deem-file-input" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"></label>
+      <div class="deem-form-actions"><button id="createTemplateBtn" class="deem-btn primary" type="button">新建模板</button></div>
+    </div>
+  </section>
+  <section class="deem-panel"><div class="deem-panel-title"><h2>模板文件说明</h2></div><div id="templateFilePreview" class="deem-preview-box">请选择一个 DOCX 模板文件。保存后会解析文档内容，并立即同步到智能检测与采集智能体的共享模板库。</div></section>
+</section>
+  </main>
+  <div class="deem-footer-org">中国科学院信息工程研究所</div>
+</div>
+<script src="/static/js/portal.js?v=real-data-20260729"></script>
+</body>
+</html>
