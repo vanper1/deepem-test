@@ -8,6 +8,8 @@
     lastFftMessage: null, liveFrameCount: 0, spectrumObjectUrl: '', baselines: [], selectedBaselineId: '',
     probeAutoOpenedKey: '', probeModalDismissed: false, artifactDetailId: '',
     probeDetailData: null, probeDetailTab: 'wifi_ap', probeDetailPage: 1, probeDetailPageSize: 25,
+    deviceDashboard: null, deviceSockets: {}, deviceWaterfalls: {}, probeLive: {}, probeTabs: {}, deviceRefreshBusy: false, probePollTimer: null, previewNodeId: '', previewDotsTimer: null,
+    reasoningModePreference: (() => { try { return localStorage.getItem('deepem.captureAgent.reasoningMode') === 'deep' ? 'deep' : 'fast'; } catch (_) { return 'fast'; } })(),
   };
 
   const el = id => document.getElementById(id);
@@ -52,6 +54,12 @@
     artifactDetailModal: el('artifactDetailModal'), artifactDetailTitle: el('artifactDetailTitle'), artifactDetailSubtitle: el('artifactDetailSubtitle'),
     artifactDetailMeta: el('artifactDetailMeta'), artifactDetailPreview: el('artifactDetailPreview'), artifactDetailDownload: el('artifactDetailDownload'),
     closeArtifactDetailBtn: el('closeArtifactDetailBtn'),
+    evidenceChainBtn: el('evidenceChainBtn'), queryDevicesBtn: el('queryDevicesBtn'), deviceQueryStatus: el('deviceQueryStatus'),
+    deviceSummaryStrip: el('deviceSummaryStrip'), deviceCarousel: el('deviceCarousel'),
+    deviceHistoryModal: el('deviceHistoryModal'), deviceHistoryTitle: el('deviceHistoryTitle'), deviceHistorySubtitle: el('deviceHistorySubtitle'),
+    deviceHistoryBody: el('deviceHistoryBody'), closeDeviceHistoryBtn: el('closeDeviceHistoryBtn'),
+    evidenceChainModal: el('evidenceChainModal'), evidenceChainSubtitle: el('evidenceChainSubtitle'), evidenceChainPolicy: el('evidenceChainPolicy'),
+    evidenceChainBody: el('evidenceChainBody'), closeEvidenceChainBtn: el('closeEvidenceChainBtn'),
   };
 
   const STATUS = {
@@ -95,7 +103,22 @@
   };
 
   const taskDisplayTitle = task => task?.display_title || (task?.task_number ? `任务${task.task_number}：${task.title || task.id}` : (task?.title || task?.id || '新建采集任务'));
-  const reasoningMode = task => String(task?.reasoning_mode || 'deep').toLowerCase() === 'fast' ? 'fast' : 'deep';
+  const reasoningMode = task => String(task?.reasoning_mode || 'fast').toLowerCase() === 'deep' ? 'deep' : 'fast';
+  function renderReasoningModeControl() {
+    if (!dom.modelModeBadge) return;
+    const mode = state.reasoningModePreference === 'deep' ? 'deep' : 'fast';
+    dom.modelModeBadge.textContent = mode === 'deep' ? '深度思考模式' : '快速模式';
+    dom.modelModeBadge.className = `capture-mode-badge ${mode}`;
+    dom.modelModeBadge.title = `当前新任务使用${mode === 'deep' ? '深度思考模式' : '快速模式'}，点击切换`;
+    dom.modelModeBadge.setAttribute('aria-pressed', mode === 'deep' ? 'true' : 'false');
+  }
+
+  function toggleReasoningMode() {
+    state.reasoningModePreference = state.reasoningModePreference === 'deep' ? 'fast' : 'deep';
+    try { localStorage.setItem('deepem.captureAgent.reasoningMode', state.reasoningModePreference); } catch (_) { /* ignore storage errors */ }
+    renderReasoningModeControl();
+    showToast(`新任务已切换为${state.reasoningModePreference === 'deep' ? '深度思考模式' : '快速模式'}`);
+  }
   const probeAssistance = task => (task?.probe_assistance && typeof task.probe_assistance === 'object') ? task.probe_assistance : null;
   const probeAssistanceActive = task => ['awaiting_confirmation', 'queued', 'running'].includes(String(probeAssistance(task)?.status || ''));
   const taskStreamActive = task => Boolean(task) && (!['completed', 'failed', 'cancelled'].includes(task.status) || probeAssistanceActive(task));
@@ -731,11 +754,447 @@
     }
   }
 
+  function safeDomId(value) {
+    return String(value || 'device').replace(/[^0-9A-Za-z_-]+/g, '_');
+  }
+
+  function deviceStatusMode(device) {
+    const status = String(device?.status || '').toUpperCase();
+    if (!device?.online) return 'offline';
+    if (['BUSY', 'RUNNING', 'CAPTURING'].includes(status)) return 'busy';
+    if (['ERROR', 'FAILED'].includes(status)) return 'error';
+    return 'online';
+  }
+
+  function disconnectDeviceSockets() {
+    Object.values(state.deviceSockets || {}).forEach(socket => {
+      if (socket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(socket.readyState)) {
+        try { socket.close(); } catch (_) { /* ignore */ }
+      }
+    });
+    state.deviceSockets = {};
+  }
+
+  function stopProbePolling() {
+    if (state.probePollTimer) clearTimeout(state.probePollTimer);
+    state.probePollTimer = null;
+  }
+
+  function deviceHistoryHtml(device) {
+    const history = Array.isArray(device.history) ? device.history : [];
+    if (!history.length) return '<div class="muted">暂无调用记录</div>';
+    return `<div class="device-history-list">${history.slice(0, 12).map((item, index) => `
+      <div class="device-history-item" data-device-history="${escapeHtml(device.device_id)}" data-device-type="${escapeHtml(device.device_type)}" data-history-index="${index}">
+        <div><strong>${escapeHtml(item.task_display_title || (item.task_number ? `任务${item.task_number}：${item.task_title || item.task_id || '采集任务'}` : (item.task_title || item.task_id || '采集任务')))}</strong><p>${escapeHtml(item.summary || item.instruction || '')}</p></div>
+        <time>${escapeHtml(fmtTime(item.ended_at || item.started_at))}</time>
+      </div>`).join('')}</div>`;
+  }
+
+  function usrpDeviceCard(device) {
+    const detail = device.details || {};
+    const config = detail.current_config || {};
+    const devConfig = detail.dev_config || {};
+    const id = safeDomId(device.device_id);
+    const mode = deviceStatusMode(device);
+    const freq = config.freq ?? config.center_freq ?? '-';
+    const rate = config.sample_rate ?? '-';
+    return `<article class="device-card usrp-device-card" data-device-card="${escapeHtml(device.device_id)}">
+      <div class="device-card-head">
+        <div class="device-card-name"><i class="device-dot ${mode}"></i><div><strong>${escapeHtml(device.display_name || 'USRP')}</strong><span>${escapeHtml(device.device_id)}</span></div></div>
+        <span class="device-status-chip ${mode}">${escapeHtml(device.status || 'UNKNOWN')}</span>
+      </div>
+      <div class="device-card-body">
+        <div class="device-card-section">
+          <div class="device-card-section-title"><strong>实时频谱 / 瀑布图</strong><span id="deviceWsState-${id}">${device.stream_info?.ws_url ? '准备订阅 FFT' : '暂无实时流地址'}</span></div>
+          <div class="device-live-chart-label"><span>频谱图</span><small>当前 FFT 功率谱</small></div>
+          <div class="device-spectrum-wrap"><canvas id="deviceSpectrum-${id}" aria-label="USRP 实时频谱图"></canvas></div>
+          <div class="device-live-chart-label waterfall-label"><span>瀑布图</span><small>时间 × 频率</small></div>
+          <div class="device-waterfall-wrap"><canvas id="deviceWaterfall-${id}" aria-label="USRP 实时瀑布图"></canvas><div class="device-waterfall-overlay"><span>FFT POWER</span><span>${escapeHtml(device.device_id)}</span></div></div>
+          <div id="deviceWaterfallMeta-${id}" class="device-live-caption">等待 USRP 实时 FFT 数据</div>
+        </div>
+        <div class="device-card-section">
+          <div class="device-card-section-title"><strong>设备状态</strong><span>${device.available_for_new_task ? '可被新任务选择' : '当前不可占用'}</span></div>
+          <div class="device-meta-grid">
+            <div><span>当前频率</span><strong>${escapeHtml(freq)}</strong></div>
+            <div><span>采样率</span><strong>${escapeHtml(rate)}</strong></div>
+            <div><span>任务 ID</span><strong>${escapeHtml(detail.task_id || '-')}</strong></div>
+            <div><span>能力</span><strong>${escapeHtml(Object.keys(devConfig).slice(0,3).join(' / ') || 'USRP')}</strong></div>
+          </div>
+        </div>
+        <div class="device-card-section">
+          <div class="device-card-section-title"><strong>调用记录</strong><span>${(device.history || []).length} 条</span></div>
+          ${deviceHistoryHtml(device)}
+        </div>
+      </div>
+    </article>`;
+  }
+
+  function probeDeviceCard(device) {
+    const detail = device.details || {};
+    const id = safeDomId(device.device_id);
+    const mode = deviceStatusMode(device);
+    const tab = state.probeTabs[device.device_id] || 'wifi_ap';
+    return `<article class="device-card probe-device-card" data-device-card="${escapeHtml(device.device_id)}">
+      <div class="device-card-head">
+        <div class="device-card-name"><i class="device-dot ${mode}"></i><div><strong>${escapeHtml(device.display_name || 'WiFi/蓝牙探针')}</strong><span>${escapeHtml(device.device_id)}</span></div></div>
+        <span class="device-status-chip ${mode}">${escapeHtml(device.status || 'UNKNOWN')}</span>
+      </div>
+      <div class="device-card-body">
+        <div class="device-card-section">
+          <div class="device-card-section-title"><strong>实时探针采集</strong><span id="probeLiveStamp-${id}">正在读取…</span></div>
+          <div class="probe-live-tabs">
+            ${[['wifi_ap','WiFi 热点'],['wifi_client','WiFi 客户端'],['bluetooth','蓝牙设备']].map(([key,label]) => `<button class="probe-live-tab ${tab === key ? 'active' : ''}" data-probe-tab="${key}" data-probe-id="${escapeHtml(device.device_id)}" type="button">${label}</button>`).join('')}
+          </div>
+          <div id="probeLive-${id}" class="probe-live-list"><div class="muted">等待探针实时数据…</div></div>
+        </div>
+        <div class="device-card-section">
+          <div class="device-card-section-title"><strong>探针状态</strong><span>${device.available_for_new_task ? '在线可用' : '不可用'}</span></div>
+          <div class="device-meta-grid">
+            <div><span>探针 ID</span><strong>${escapeHtml(device.device_id)}</strong></div>
+            <div><span>位置</span><strong>${escapeHtml(detail.location || detail.area || '-')}</strong></div>
+            <div><span>IP/接口</span><strong>${escapeHtml(detail.ip || detail.address || detail.interface || '-')}</strong></div>
+            <div><span>最近在线</span><strong>${escapeHtml(detail.last_seen || detail.updated_at || '-')}</strong></div>
+          </div>
+        </div>
+        <div class="device-card-section">
+          <div class="device-card-section-title"><strong>调用记录</strong><span>${(device.history || []).length} 条</span></div>
+          ${deviceHistoryHtml(device)}
+        </div>
+      </div>
+    </article>`;
+  }
+
+  function waitingDeviceCard() {
+    return `<article class="waiting-device-card"><div class="waiting-device-inner"><div class="waiting-device-icon">＋</div><strong>等待新设备接入</strong><span>新 USRP、WiFi/蓝牙探针或后续其他采集设备上线后，会在下一次查询时自动加入此工作台。</span></div></article>`;
+  }
+
+  function drawDeviceWaterfallPlaceholder(canvas, message = '等待实时 FFT 数据') {
+    if (!canvas) return;
+    const { width, height } = sizeCanvas(canvas, 420, 176);
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#041019'; ctx.fillRect(0,0,width,height);
+    ctx.fillStyle = '#6e8996'; ctx.font = '10px sans-serif'; ctx.fillText(message, 12, 24);
+    ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.strokeRect(.5,.5,width-1,height-1);
+  }
+
+  function drawDeviceSpectrumPlaceholder(canvas, message = '等待实时 FFT 数据') {
+    if (!canvas) return;
+    const { width, height } = sizeCanvas(canvas, 420, 96);
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#041019'; ctx.fillRect(0,0,width,height);
+    ctx.fillStyle = '#6e8996'; ctx.font = '10px sans-serif'; ctx.fillText(message, 12, 22);
+    ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.strokeRect(.5,.5,width-1,height-1);
+  }
+
+  function renderDeviceWaterfall(deviceId, message) {
+    if (!message || message.type !== 'fft') return;
+    const fft = (Array.isArray(message.fft_data) ? message.fft_data : []).map(Number).filter(Number.isFinite);
+    if (!fft.length) return;
+    const id = safeDomId(deviceId);
+    const canvas = el(`deviceWaterfall-${id}`);
+    const spectrum = el(`deviceSpectrum-${id}`);
+    if (!canvas) return;
+    const minValue = Math.min(...fft), maxValue = Math.max(...fft), span = Math.max(maxValue - minValue, 1e-6);
+
+    if (spectrum) {
+      const { width: spectrumWidth, height: spectrumHeight } = sizeCanvas(spectrum, 420, 96);
+      const sctx = spectrum.getContext('2d');
+      sctx.fillStyle = '#041019'; sctx.fillRect(0,0,spectrumWidth,spectrumHeight);
+      sctx.strokeStyle = 'rgba(255,255,255,.065)'; sctx.lineWidth = 1;
+      for (let line = 1; line < 4; line += 1) {
+        const y = spectrumHeight * line / 4;
+        sctx.beginPath(); sctx.moveTo(0, y); sctx.lineTo(spectrumWidth, y); sctx.stroke();
+      }
+      sctx.strokeStyle = '#67e5be'; sctx.lineWidth = 1.6; sctx.beginPath();
+      fft.forEach((value, index) => {
+        const x = fft.length <= 1 ? 0 : index / (fft.length - 1) * spectrumWidth;
+        const y = spectrumHeight - 7 - (value - minValue) / span * (spectrumHeight - 16);
+        if (index === 0) sctx.moveTo(x, y); else sctx.lineTo(x, y);
+      });
+      sctx.stroke();
+      sctx.fillStyle = '#83a1ae'; sctx.font = '8px sans-serif';
+      sctx.fillText(`${maxValue.toFixed(1)} dB`, 7, 11);
+      sctx.fillText(`${minValue.toFixed(1)} dB`, 7, spectrumHeight - 4);
+      sctx.strokeStyle='rgba(255,255,255,.08)'; sctx.strokeRect(.5,.5,spectrumWidth-1,spectrumHeight-1);
+    }
+
+    const row = fft.map(value => Math.round((value - minValue) / span * 255));
+    const rows = state.deviceWaterfalls[deviceId] || [];
+    rows.push(row); state.deviceWaterfalls[deviceId] = rows.slice(-90);
+    const { width, height } = sizeCanvas(canvas, 420, 176);
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#041019'; ctx.fillRect(0,0,width,height);
+    const visibleRows = state.deviceWaterfalls[deviceId];
+    visibleRows.forEach((values, rowIndex) => {
+      const y = rowIndex / Math.max(visibleRows.length,1) * height;
+      const h = Math.ceil(height / Math.max(visibleRows.length,1));
+      values.forEach((value, colIndex) => {
+        const [r,g,b] = powerColor(value);
+        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        const x = colIndex / values.length * width;
+        ctx.fillRect(x, y, Math.ceil(width / values.length), h);
+      });
+    });
+    ctx.strokeStyle='rgba(255,255,255,.08)'; ctx.strokeRect(.5,.5,width-1,height-1);
+    const center = Number(message.freq || 0), sampleRate = Number(message.sample_rate || 0);
+    const meta = el(`deviceWaterfallMeta-${id}`);
+    if (meta) meta.textContent = `中心 ${fmtFreq(center)} ｜ FFT ${message.fft_size || fft.length} ｜ ${minValue.toFixed(1)} ~ ${maxValue.toFixed(1)} dB`;
+  }
+
+  function connectDeviceWaterfall(device) {
+    const url = String(device?.stream_info?.ws_url || '').trim();
+    const id = safeDomId(device.device_id);
+    const canvas = el(`deviceWaterfall-${id}`);
+    const spectrum = el(`deviceSpectrum-${id}`);
+    if (!url || !device.online || typeof WebSocket === 'undefined') {
+      drawDeviceWaterfallPlaceholder(canvas, url ? '设备当前离线' : '暂无实时 FFT 地址');
+      drawDeviceSpectrumPlaceholder(spectrum, url ? '设备当前离线' : '暂无实时 FFT 地址');
+      return;
+    }
+    drawDeviceWaterfallPlaceholder(canvas, '正在连接实时 FFT…');
+    drawDeviceSpectrumPlaceholder(spectrum, '正在连接实时 FFT…');
+    try {
+      const socket = new WebSocket(url);
+      state.deviceSockets[device.device_id] = socket;
+      socket.onopen = () => { const target = el(`deviceWsState-${id}`); if (target) target.textContent='实时流已连接'; };
+      socket.onmessage = event => {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === 'fft') renderDeviceWaterfall(device.device_id, message);
+          else if (message.type === 'status') { const target=el(`deviceWsState-${id}`); if (target) target.textContent=String(message.status || '已连接'); }
+        } catch (_) { /* ignore malformed frame */ }
+      };
+      socket.onerror = () => { const target=el(`deviceWsState-${id}`); if (target) target.textContent='实时流连接失败'; };
+      socket.onclose = () => { if (state.deviceSockets[device.device_id] === socket) delete state.deviceSockets[device.device_id]; };
+    } catch (error) {
+      drawDeviceWaterfallPlaceholder(canvas, `实时流连接失败：${error.message}`);
+      drawDeviceSpectrumPlaceholder(spectrum, `实时流连接失败：${error.message}`);
+    }
+  }
+
+  function renderDeviceDashboard() {
+    if (!dom.deviceCarousel) return;
+    const dashboard = state.deviceDashboard;
+    if (!dashboard) {
+      dom.deviceCarousel.className = 'device-carousel';
+      dom.deviceCarousel.innerHTML = '<div class="device-empty-state"><div class="empty-icon">⌁</div><strong>尚未查询设备</strong><span>点击“查询可用设备”自动探测 USRP 与 WiFi/蓝牙探针。</span></div>';
+      return;
+    }
+    disconnectDeviceSockets();
+    const devices = Array.isArray(dashboard.devices) ? dashboard.devices : [];
+    const onlineCount = devices.filter(item => item.online).length;
+    dom.deviceCarousel.className = `device-carousel${onlineCount > 2 ? ' scrolling' : ''}`;
+    dom.deviceCarousel.innerHTML = devices.map(device => device.device_type === 'usrp' ? usrpDeviceCard(device) : probeDeviceCard(device)).join('') + waitingDeviceCard();
+    if (dom.deviceQueryStatus) dom.deviceQueryStatus.textContent = `上次查询 ${fmtTime(dashboard.queried_at)}`;
+    const usrpCount = devices.filter(item => item.device_type === 'usrp' && item.online).length;
+    const probeCount = devices.filter(item => item.device_type === 'wifi_bluetooth_probe' && item.online).length;
+    const errorCount = (dashboard.errors || []).length;
+    dom.deviceSummaryStrip.innerHTML = `<span><i class="device-dot online"></i> 在线 ${onlineCount}</span><span>USRP ${usrpCount}</span><span>WiFi/蓝牙探针 ${probeCount}</span>${errorCount ? `<span><i class="device-dot error"></i> ${errorCount} 个接口异常</span>` : ''}`;
+    dom.deviceCarousel.querySelectorAll('[data-device-history]').forEach(row => row.addEventListener('click', () => openDeviceHistory(row.dataset.deviceType, row.dataset.deviceHistory, Number(row.dataset.historyIndex || 0))));
+    dom.deviceCarousel.querySelectorAll('[data-probe-tab]').forEach(button => button.addEventListener('click', () => {
+      state.probeTabs[button.dataset.probeId] = button.dataset.probeTab;
+      const card = button.closest('.probe-device-card');
+      card?.querySelectorAll('[data-probe-tab]').forEach(item => item.classList.toggle('active', item === button));
+      renderProbeLiveIntoCard(button.dataset.probeId);
+    }));
+    devices.filter(item => item.device_type === 'usrp').forEach(connectDeviceWaterfall);
+    devices.filter(item => item.device_type === 'wifi_bluetooth_probe' && item.online).forEach(device => fetchProbeLive(device.device_id));
+    scheduleProbePolling();
+  }
+
+  async function refreshDeviceDashboard(refresh = false) {
+    if (state.deviceRefreshBusy) return;
+    state.deviceRefreshBusy = true;
+    stopProbePolling();
+    if (dom.queryDevicesBtn) dom.queryDevicesBtn.disabled = true;
+    if (dom.deviceQueryStatus) dom.deviceQueryStatus.textContent = refresh ? '正在扫描设备…' : '正在读取设备状态…';
+    try {
+      const payload = await api(`/api/capture-agent/devices?refresh=${refresh ? 'true' : 'false'}`);
+      state.deviceDashboard = payload.item || { devices: [], errors: [] };
+      renderDeviceDashboard();
+      if (refresh) showToast(`设备查询完成，在线 ${state.deviceDashboard.online_count || 0} 台`);
+    } catch (error) {
+      if (dom.deviceQueryStatus) dom.deviceQueryStatus.textContent = '设备查询失败';
+      if (refresh) showToast(error.message, true);
+    } finally {
+      state.deviceRefreshBusy = false;
+      if (dom.queryDevicesBtn) dom.queryDevicesBtn.disabled = false;
+    }
+  }
+
+  async function fetchProbeLive(probeId) {
+    try {
+      const payload = await api(`/api/capture-agent/devices/probes/${encodeURIComponent(probeId)}/live?page_size=40`);
+      state.probeLive[probeId] = payload.item || {};
+      renderProbeLiveIntoCard(probeId);
+    } catch (error) {
+      state.probeLive[probeId] = { error: error.message, items: {} };
+      renderProbeLiveIntoCard(probeId);
+    }
+  }
+
+  function renderProbeLiveIntoCard(probeId) {
+    const id = safeDomId(probeId), target = el(`probeLive-${id}`), stamp = el(`probeLiveStamp-${id}`);
+    if (!target) return;
+    const live = state.probeLive[probeId] || {};
+    const tab = state.probeTabs[probeId] || 'wifi_ap';
+    if (live.error) { target.innerHTML = `<div class="muted">${escapeHtml(live.error)}</div>`; if (stamp) stamp.textContent='读取失败'; return; }
+    const block = live.items?.[tab] || {};
+    const items = (block.targets || []).slice(0, 35);
+    if (stamp) stamp.textContent = live.queried_at ? `更新 ${fmtTime(live.queried_at)} · ${block.target_total ?? items.length} 个` : '等待数据';
+    if (!items.length) { target.innerHTML = '<div class="muted">当前未发现此类设备</div>'; return; }
+    target.innerHTML = items.map(row => {
+      const name = row.name || row.ssid || row.device_name || row.mac || row.bssid || '未命名设备';
+      const identity = row.mac || row.bssid || row.vendor || row.connected_ssid || '-';
+      const rssi = row.rssi_latest ?? row.rssi ?? '-';
+      return `<div class="probe-live-row"><strong title="${escapeHtml(name)}">${escapeHtml(name)}</strong><span title="${escapeHtml(identity)}">${escapeHtml(identity)}</span><em>${escapeHtml(rssi === '-' ? '-' : `${rssi} dBm`)}</em></div>`;
+    }).join('');
+  }
+
+  function scheduleProbePolling() {
+    stopProbePolling();
+    const probes = (state.deviceDashboard?.devices || []).filter(item => item.device_type === 'wifi_bluetooth_probe' && item.online);
+    if (!probes.length) return;
+    state.probePollTimer = setTimeout(async () => {
+      for (const device of probes) await fetchProbeLive(device.device_id);
+      scheduleProbePolling();
+    }, 6000);
+  }
+
+  function findDashboardDevice(deviceType, deviceId) {
+    return (state.deviceDashboard?.devices || []).find(item => item.device_type === deviceType && item.device_id === deviceId);
+  }
+
+  function openDeviceHistory(deviceType, deviceId, historyIndex) {
+    const device = findDashboardDevice(deviceType, deviceId);
+    const item = device?.history?.[historyIndex];
+    if (!item || !dom.deviceHistoryModal) return;
+    dom.deviceHistoryTitle.textContent = `${device.display_name || deviceId} · 调用详情`;
+    dom.deviceHistorySubtitle.textContent = item.task_display_title || (item.task_number ? `任务${item.task_number}：${item.task_title || item.task_id || ''}` : (item.task_title || item.task_id || ''));
+    const summary = deviceType === 'wifi_bluetooth_probe' ? (item.intelligent_summary || item.summary || '暂无智能研判摘要') : (item.summary || item.instruction || '暂无任务摘要');
+    const artifacts = (item.artifacts || []).map(artifact => `<div class="device-history-artifact"><strong title="${escapeHtml(artifact.file_name || '')}">${escapeHtml(artifact.file_name || artifact.kind || '任务产物')}</strong><a href="${escapeHtml(artifact.download_url || '#')}" ${artifact.download_url ? 'target="_blank"' : ''}>查看</a></div>`).join('') || '<span class="muted">暂无任务产物</span>';
+    dom.deviceHistoryBody.innerHTML = `
+      <div class="device-history-overview">
+        <div><span>任务</span><strong>${escapeHtml(item.task_title || item.task_id || '-')}</strong></div>
+        <div><span>节点状态</span><strong>${escapeHtml(statusLabel(item.node_status))}</strong></div>
+        <div><span>开始</span><strong>${escapeHtml(fmtTime(item.started_at))}</strong></div>
+        <div><span>结束</span><strong>${escapeHtml(fmtTime(item.ended_at))}</strong></div>
+      </div>
+      <div class="device-history-summary">${escapeHtml(summary)}</div>
+      ${item.evidence_set_id ? `<div class="device-history-summary">证据集：${escapeHtml(item.evidence_set_id)} · 详细探针记录已落库，可按需检索。</div>` : ''}
+      <h3>${deviceType === 'usrp' ? '任务产物' : '相关产物'}</h3><div class="device-history-artifacts">${artifacts}</div>`;
+    dom.deviceHistoryModal.classList.remove('hidden');
+  }
+
+  function closeDeviceHistory() { dom.deviceHistoryModal?.classList.add('hidden'); }
+
+  async function openEvidenceChain() {
+    const task = state.currentTask;
+    if (!task || !dom.evidenceChainModal) return;
+    dom.evidenceChainModal.classList.remove('hidden');
+    dom.evidenceChainBody.innerHTML = '<div class="empty compact">正在构建设备—证据链…</div>';
+    try {
+      const payload = await api(`/api/capture-agent/tasks/${encodeURIComponent(task.id)}/device-evidence-chain`);
+      renderEvidenceChain(payload.item || {});
+    } catch (error) {
+      dom.evidenceChainBody.innerHTML = `<div class="empty compact">${escapeHtml(error.message)}</div>`;
+    }
+  }
+
+  function renderEvidenceChain(chain) {
+    const policy = chain.association_policy || {};
+    dom.evidenceChainPolicy.innerHTML = `<strong>关联规则：</strong> ${escapeHtml(policy.warning || '设备证据链用于汇聚线索，不自动把共现解释为同一物理设备。')}`;
+    if (dom.evidenceChainSubtitle) dom.evidenceChainSubtitle.textContent = `${chain.device_count || 0} 个逻辑设备 · ${chain.generated_from_evidence_sets?.length || 0} 个探针证据集`;
+    const devices = chain.devices || [];
+    if (!devices.length) {
+      dom.evidenceChainBody.innerHTML = '<div class="empty compact"><strong>暂未形成设备—证据链</strong><span>完成包含 WiFi/蓝牙探针的采集任务后，这里会按设备名称、MAC/BSSID 和跨模态任务证据统一陈列。</span></div>';
+      return;
+    }
+    dom.evidenceChainBody.innerHTML = devices.map(device => {
+      const evidence = (device.evidence || []).slice(0, 120);
+      return `<details class="evidence-device-card">
+        <summary class="evidence-device-head">
+          <div><h3>${escapeHtml(device.display_name || device.device_id)}</h3><p>${escapeHtml((device.identifiers || []).join(' · ') || '无强标识')} · IQ/频谱 ${Number(device.iq_spectrum_evidence_count || 0)} 条 · 总证据 ${Number(device.evidence_count || 0)} 条 · 身份置信 ${escapeHtml(device.identity_confidence || '-')}</p></div>
+          <div class="evidence-modality-chips">${(device.modalities || []).map(item => `<span>${escapeHtml(item)}</span>`).join('')}</div>
+        </summary>
+        <div class="evidence-list">${evidence.map(item => {
+          if (item.evidence_type === 'task_artifact') {
+            const artifact = item.artifact || {};
+            return `<div class="evidence-row"><span>${escapeHtml(item.modality || '任务产物')}</span><div><strong>${escapeHtml(artifact.file_name || artifact.kind || '任务产物')}</strong><br><span class="evidence-association-note">${escapeHtml(item.note || '')}</span></div><small>${artifact.download_url ? `<a href="${escapeHtml(artifact.download_url)}" target="_blank">查看产物</a>` : '任务级共现'}</small></div>`;
+          }
+          const identity = [item.name, item.mac, item.ssid, item.bssid, item.vendor].filter(Boolean).join(' · ');
+          const tail = [item.probe_id, item.last_seen, item.rssi !== null && item.rssi !== undefined ? `${item.rssi} dBm` : ''].filter(Boolean).join(' · ');
+          return `<div class="evidence-row"><span>${escapeHtml(item.modality || item.kind || '探针')}</span><div>${escapeHtml(identity || '探针记录')}</div><small>${escapeHtml(tail || item.evidence_set_id || '')}</small></div>`;
+        }).join('')}</div>
+      </details>`;
+    }).join('');
+  }
+
+  function closeEvidenceChain() { dom.evidenceChainModal?.classList.add('hidden'); }
+
+  function stopNodePreviewDots() {
+    if (state.previewDotsTimer) clearInterval(state.previewDotsTimer);
+    state.previewDotsTimer = null;
+  }
+
+  function removeNodePreview(clearState = true) {
+    stopNodePreviewDots();
+    document.querySelector('.node-preview-popover')?.remove();
+    if (clearState) state.previewNodeId = '';
+  }
+
+  function nodePreviewSummary(node) {
+    const text = String(node?.outputs?.llm_status_summary || node?.summary || node?.description || '等待执行').trim();
+    return node?.status === 'in_progress' ? text.replace(/[。.!！?？…]+$/g, '') : text;
+  }
+
+  function startNodePreviewDots(pop, node) {
+    stopNodePreviewDots();
+    const target = pop?.querySelector('[data-node-preview-dots]');
+    if (!target || node?.status !== 'in_progress') {
+      if (target) target.textContent = '';
+      return;
+    }
+    let count = 1;
+    target.textContent = '.';
+    state.previewDotsTimer = setInterval(() => {
+      count = count >= 3 ? 1 : count + 1;
+      target.textContent = '.'.repeat(count);
+    }, 420);
+  }
+
+  function showNodePreview(node, anchor) {
+    removeNodePreview(false);
+    if (!node || !anchor) return;
+    state.previewNodeId = node.id;
+    const pop = document.createElement('div');
+    pop.className = 'node-preview-popover';
+    const tool = node.tool_name || node.allowed_tool || node.executor || node.kind || '系统节点';
+    pop.innerHTML = `<div class="node-preview-head"><strong>${escapeHtml(node.title || node.id)}</strong><span class="node-state">${escapeHtml(statusLabel(node.status))}</span></div>
+      <p><span data-node-preview-summary>${escapeHtml(nodePreviewSummary(node))}</span><span class="node-preview-live-dots" data-node-preview-dots aria-hidden="true"></span></p>
+      <div class="node-preview-meta"><span>进度 ${Number(node.progress || 0)}%</span><span>${escapeHtml(tool)}</span><span>${escapeHtml(fmtTime(node.updated_at))}</span></div>
+      <div class="node-preview-actions"><button data-node-preview-close type="button">关闭</button><button class="primary" data-node-preview-detail type="button">查看详细</button></div>`;
+    const sidebar = dom.planNodeList.closest('.sidebar');
+    sidebar.appendChild(pop);
+    const listTop = dom.planNodeList.offsetTop;
+    const targetTop = listTop + anchor.offsetTop - dom.planNodeList.scrollTop;
+    const popHeight = Math.max(1, pop.offsetHeight || 132);
+    pop.style.top = `${Math.max(8, targetTop - popHeight - 8)}px`;
+    startNodePreviewDots(pop, node);
+    pop.querySelector('[data-node-preview-close]').addEventListener('click', event => { event.stopPropagation(); removeNodePreview(true); });
+    pop.querySelector('[data-node-preview-detail]').addEventListener('click', event => {
+      event.stopPropagation();
+      if (!state.currentTask) return;
+      window.location.href = `/capture-agent/node-detail?task=${encodeURIComponent(state.currentTask.id)}&node=${encodeURIComponent(node.id)}`;
+    });
+  }
+
   function renderEmptyTask() {
     state.currentTask = null;
     state.selectedNodeId = null;
     state.probeAutoOpenedKey = '';
-    if (dom.modelModeBadge) { dom.modelModeBadge.textContent = '深度思考模式'; dom.modelModeBadge.className = 'capture-mode-badge deep'; }
+    removeNodePreview();
+    renderReasoningModeControl();
     dom.probeAssistBtn?.classList.add('hidden');
     closeProbeAssistModal();
     if (dom.currentTaskTitle) dom.currentTaskTitle.textContent = '新建采集任务';
@@ -744,26 +1203,19 @@
     if (dom.overallProgressText) dom.overallProgressText.textContent = '0%';
     dom.overallProgressBar.style.width = '0%';
     dom.planNodeList.innerHTML = '<div class="empty compact">创建任务后显示执行节点</div>';
-    dom.detailEmpty.classList.remove('hidden');
-    dom.detailContent.classList.add('hidden');
     clearReasoning();
     dom.artifactList.innerHTML = '<span class="muted">完成后显示结果与报告</span>';
     disconnectLiveSpectrum();
     resetLiveSpectrum();
-    dom.liveSpectrumCard.classList.add('hidden');
+    dom.liveSpectrumCard?.classList.add('hidden');
     hideApprovalModal();
     updateActions();
   }
-
   function renderTask() {
     const task = state.currentTask;
     if (!task) return renderEmptyTask();
     if (dom.currentTaskTitle) dom.currentTaskTitle.textContent = taskDisplayTitle(task);
-    const mode = reasoningMode(task);
-    if (dom.modelModeBadge) {
-      dom.modelModeBadge.textContent = mode === 'fast' ? '快速模式' : '深度思考模式';
-      dom.modelModeBadge.className = `capture-mode-badge ${mode}`;
-    }
+    renderReasoningModeControl();
     if (dom.planVersion) dom.planVersion.textContent = `v${task.plan_version || 1}${task.plan_locked ? ' · 已锁定' : ''}`;
     const planner = task.planner || state.runtime || {};
     if (dom.plannerModel) dom.plannerModel.textContent = `${planner.model || '规划服务'} · ${planner.endpoint || ''}`;
@@ -774,13 +1226,13 @@
     renderNodes();
     renderSelectedNode();
     renderArtifacts();
-    syncLiveSpectrumFromTask();
+    // 0907: 节点详情已迁移到独立页面，主页面不再为隐藏详情建立 USRP 直播连接。
+    disconnectLiveSpectrum();
+    dom.liveSpectrumCard?.classList.add('hidden');
     renderApprovalModal();
-    renderProbeAssistance();
     updateActions();
     dom.taskPicker.value = task.id;
   }
-
   function renderApprovalModal() {
     const task = state.currentTask;
     if (!task || task.status !== 'awaiting_approval') {
@@ -790,49 +1242,66 @@
     if (state.approvalDirty && state.approvalModalTaskId === task.id && !dom.approvalModal.classList.contains('hidden')) {
       return;
     }
+    const selectedTypes = task.device_selection?.selected_device_types || [];
+    const hasUsrp = selectedTypes.includes('usrp');
     const prepare = task.plan_candidate?.prepare_result || {};
     const constraints = task.constraints || {};
-    const values = {
-      room_name: prepare.room_name ?? constraints.room_name ?? '',
-      freq_start_mhz: prepare.freq_start_mhz ?? constraints.freq_start_mhz ?? '',
-      freq_stop_mhz: prepare.freq_stop_mhz ?? constraints.freq_stop_mhz ?? '',
-      freq_step_mhz: prepare.freq_step_mhz ?? constraints.freq_step_mhz ?? '',
-      dwell_ms: prepare.dwell_ms ?? (constraints.dwell_time_sec ? Number(constraints.dwell_time_sec) * 1000 : ''),
-      repeat_count: prepare.repeat_count ?? constraints.repeat_count ?? '',
-      sample_rate: prepare.sample_rate ?? constraints.sample_rate ?? '',
-      bandwidth: prepare.bandwidth ?? constraints.bandwidth ?? '',
-      gain: prepare.gain ?? constraints.gain ?? '',
-      antenna: prepare.antenna ?? constraints.antenna ?? '',
-    };
-    dom.approvalParamGrid.innerHTML = [
-      ...APPROVAL_FIELDS.map(field => `
-        <label class="param-item editable-param">
-          <span>${escapeHtml(field.label)}</span>
-          <input data-approval-param="${escapeHtml(field.key)}" type="${field.type}" step="${field.step || ''}" value="${escapeHtml(values[field.key] ?? '')}">
-        </label>`),
-      `<div class="param-item readonly-param"><span>计划 ID</span><strong title="${escapeHtml(prepare.plan_id || '-')}">${escapeHtml(prepare.plan_id || '-')}</strong></div>`,
-      `<div class="param-item readonly-param"><span>聚合方式</span><strong>${escapeHtml(prepare.aggregation || '-')}</strong></div>`,
-      `<div class="param-item readonly-param"><span>预计耗时</span><strong>${escapeHtml(prepare.estimated_total_sec ?? '-')} s</strong></div>`,
-    ].join('');
-    dom.approvalParamGrid.querySelectorAll('[data-approval-param]').forEach(input => {
-      input.addEventListener('input', () => {
-        state.approvalDirty = true;
-        dom.approvalParamStatus.textContent = '参数已修改，批准前请保存';
+    if (hasUsrp) {
+      const values = {
+        room_name: prepare.room_name ?? constraints.room_name ?? '',
+        freq_start_mhz: prepare.freq_start_mhz ?? constraints.freq_start_mhz ?? '',
+        freq_stop_mhz: prepare.freq_stop_mhz ?? constraints.freq_stop_mhz ?? '',
+        freq_step_mhz: prepare.freq_step_mhz ?? constraints.freq_step_mhz ?? '',
+        dwell_ms: prepare.dwell_ms ?? (constraints.dwell_time_sec ? Number(constraints.dwell_time_sec) * 1000 : ''),
+        repeat_count: prepare.repeat_count ?? constraints.repeat_count ?? '',
+        sample_rate: prepare.sample_rate ?? constraints.sample_rate ?? '',
+        bandwidth: prepare.bandwidth ?? constraints.bandwidth ?? '',
+        gain: prepare.gain ?? constraints.gain ?? '',
+        antenna: prepare.antenna ?? constraints.antenna ?? '',
+      };
+      dom.approvalParamGrid.innerHTML = [
+        ...APPROVAL_FIELDS.map(field => `
+          <label class="param-item editable-param">
+            <span>${escapeHtml(field.label)}</span>
+            <input data-approval-param="${escapeHtml(field.key)}" type="${field.type}" step="${field.step || ''}" value="${escapeHtml(values[field.key] ?? '')}">
+          </label>`),
+        `<div class="param-item readonly-param"><span>计划 ID</span><strong title="${escapeHtml(prepare.plan_id || '-')}">${escapeHtml(prepare.plan_id || '-')}</strong></div>`,
+        `<div class="param-item readonly-param"><span>聚合方式</span><strong>${escapeHtml(prepare.aggregation || '-')}</strong></div>`,
+        `<div class="param-item readonly-param"><span>预计耗时</span><strong>${escapeHtml(prepare.estimated_total_sec ?? '-')} s</strong></div>`,
+      ].join('');
+      dom.approvalParamGrid.querySelectorAll('[data-approval-param]').forEach(input => {
+        input.addEventListener('input', () => {
+          state.approvalDirty = true;
+          dom.approvalParamStatus.textContent = '参数已修改，批准前请保存';
+        });
       });
-    });
-    const steps = (task.nodes || [])
-      .filter(node => !['template_analysis', 'instruction_analysis', 'plan_generation', 'approval'].includes(node.id))
-      .map(node => node.title || node.id);
+      dom.saveApprovalParamsBtn.classList.remove('hidden');
+    } else {
+      const selection = task.device_selection || {};
+      const deviceNames = (task.available_devices?.devices || [])
+        .filter(item => selectedTypes.includes(item.device_type))
+        .map(item => item.display_name || item.id || item.device_type);
+      dom.approvalParamGrid.innerHTML = `
+        <div class="approval-probe-only">
+          <strong>本任务无需 USRP 频谱参数</strong>
+          <p>智能体根据任务背景和当前在线设备，选择了 ${escapeHtml(selectedTypes.map(type => type === 'wifi_bluetooth_probe' ? 'WiFi/蓝牙探针' : type).join(' + ') || '探针设备')}。</p>
+          <span>目标设备：${escapeHtml(deviceNames.join('、') || '按当前可用设备执行')}</span>
+          <span>探针类型：${escapeHtml((selection.probe_kinds || []).join('、') || '按任务需求')}</span>
+          <span>选择依据：${escapeHtml(Object.values(selection.rationale || {}).join('；') || selection.objective || '由规划模型综合任务背景与设备可用性判断')}</span>
+        </div>`;
+      dom.saveApprovalParamsBtn.classList.add('hidden');
+    }
+    const bootstrap = new Set(['template_analysis', 'device_discovery', 'device_selection', 'instruction_analysis', 'plan_generation', 'approval']);
+    const steps = (task.nodes || []).filter(node => !bootstrap.has(node.id)).map(node => node.title || node.id);
     dom.approvalFlow.innerHTML = steps.map((step, index) => `
       <span class="flow-step"><b>${index + 1}</b>${escapeHtml(step)}</span>${index < steps.length - 1 ? '<span class="flow-arrow">→</span>' : ''}
-    `).join('') || '<span class="muted">等待生成固定工具流程</span>';
+    `).join('') || '<span class="muted">等待生成自适应设备执行流程</span>';
     dom.approvalParamStatus.textContent = '';
     setStatus(dom.approvalModalStatus, task.status);
     dom.approvalModal.classList.remove('hidden');
     state.approvalModalTaskId = task.id;
     state.approvalDirty = false;
   }
-
   function hideApprovalModal() {
     dom.approvalModal.classList.add('hidden');
     state.approvalModalTaskId = null;
@@ -842,6 +1311,8 @@
 
   function renderNodes() {
     const task = state.currentTask;
+    const previewNodeId = state.previewNodeId;
+    removeNodePreview(false);
     if (!task?.nodes?.length) {
       dom.planNodeList.innerHTML = '<div class="empty compact">正在生成计划</div>';
       return;
@@ -856,65 +1327,33 @@
         </div>
         <span class="node-state">${escapeHtml(statusLabel(node.status))}</span>
       </div>`).join('');
-    dom.planNodeList.querySelectorAll('[data-node-id]').forEach(item => item.addEventListener('click', () => {
-      state.selectedNodeId = item.dataset.nodeId;
-      renderNodes();
+    dom.planNodeList.querySelectorAll('[data-node-id]').forEach(item => item.addEventListener('click', event => {
+      const node = task.nodes.find(candidate => candidate.id === item.dataset.nodeId);
+      if (!node) return;
+      state.selectedNodeId = node.id;
+      dom.planNodeList.querySelectorAll('[data-node-id]').forEach(elm => elm.classList.toggle('selected', elm === item));
       renderSelectedNode();
+      showNodePreview(node, item);
+      event.stopPropagation();
     }));
+    if (previewNodeId) {
+      const anchor = dom.planNodeList.querySelector(`[data-node-id="${CSS.escape(previewNodeId)}"]`);
+      const previewNode = task.nodes.find(candidate => candidate.id === previewNodeId);
+      if (anchor && previewNode) showNodePreview(previewNode, anchor);
+    }
   }
-
   function renderSelectedNode() {
     const task = state.currentTask;
-    const node = task?.nodes?.find(item => item.id === state.selectedNodeId) || task?.nodes?.find(item => item.id === task.current_node_id) || task?.nodes?.[0];
+    const node = task?.nodes?.find(item => item.id === state.selectedNodeId)
+      || task?.nodes?.find(item => item.id === task.current_node_id)
+      || task?.nodes?.[0];
     if (!node) {
-      dom.detailEmpty.classList.remove('hidden');
-      dom.detailContent.classList.add('hidden');
-      dom.liveSpectrumCard.classList.add('hidden');
       clearReasoning();
       return;
     }
     state.selectedNodeId = node.id;
-    dom.detailEmpty.classList.add('hidden');
-    dom.detailContent.classList.remove('hidden');
-    dom.detailTitle.textContent = node.title;
-    dom.detailSubtitle.textContent = node.description || '';
-    setStatus(dom.detailStatus, node.status);
-    dom.nodeProgress.textContent = `${Number(node.progress || 0)}%`;
-    dom.nodeAttempts.textContent = String(node.attempts || 0);
-    dom.nodeStarted.textContent = fmtTime(node.started_at);
-    dom.nodeEnded.textContent = fmtTime(node.ended_at);
-    dom.nodeSummary.textContent = node.summary || '等待执行';
-    dom.nodeSummaryTime.textContent = fmtTime(node.updated_at);
-    dom.nodeDescription.textContent = node.description || '-';
-    dom.nodeCriteria.innerHTML = (node.success_criteria || []).map(item => `<div class="criteria-item">${escapeHtml(item)}</div>`).join('') || '<span class="muted">未设置</span>';
-    const deps = node.dependencies || [];
-    dom.nodeDependencies.innerHTML = deps.length ? deps.map(dep => `<span class="chip">${escapeHtml(task.nodes.find(n => n.id === dep)?.title || dep)}</span>`).join('') : '<span class="chip">无前置依赖</span>';
-    dom.nodeTool.textContent = node.tool_name || node.allowed_tool || (node.kind ? `分析节点 · ${node.kind}` : '系统节点');
-    dom.nodeInputs.textContent = safeJson(node.inputs || {});
-    dom.nodeOutputs.textContent = safeJson(node.outputs || {});
-
-    const logs = node.logs || [];
-    dom.logCount.textContent = `${logs.length} 条`;
-    dom.nodeLogs.innerHTML = logs.length ? logs.slice(-30).reverse().map(entry => `
-      <div class="log-entry ${escapeHtml(entry.level || 'info')}">
-        <time>${escapeHtml(fmtTime(entry.timestamp))}</time>
-        <span class="log-level">${escapeHtml(entry.level || 'info')}</span>
-        <span>${escapeHtml(entry.message || '')}</span>
-      </div>`).join('') : '<span class="muted">暂无日志</span>';
-
-    dom.nodeNote.value = node.notes || '';
-    dom.noteSaveStatus.textContent = '';
-    if ((node.tool_name === 'generate_usrp_task_code' || node.tool_name === 'run_autonomous_usrp_task') && task.generated_code) {
-      dom.codeCard.classList.remove('hidden');
-      dom.generatedCode.textContent = task.generated_code;
-    } else {
-      dom.codeCard.classList.add('hidden');
-      dom.generatedCode.textContent = '';
-    }
-    updateLiveSpectrumCard(node);
     renderReasoning(node);
   }
-
   function renderReasoning(node) {
     const mode = reasoningMode(state.currentTask);
     const reasoning = String(node?.outputs?.llm_reasoning || '');
@@ -976,6 +1415,11 @@
         if (state.selectedNodeId === node.id) {
           dom.reasoningSummary.textContent = summary;
           dom.reasoningSummaryMeta.textContent = `当前模型实时摘要 · ${fmtTime(node.outputs.llm_status_summary_updated_at)}`;
+        }
+        if (state.previewNodeId === node.id) {
+          const preview = document.querySelector('.node-preview-popover');
+          const target = preview?.querySelector('[data-node-preview-summary]');
+          if (target) target.textContent = summary;
         }
       }
       return;
@@ -1149,8 +1593,8 @@
     if (dom.pauseTaskBtn) dom.pauseTaskBtn.disabled = !['planning', 'running'].includes(status);
     if (dom.resumeTaskBtn) dom.resumeTaskBtn.disabled = status !== 'paused';
     dom.cancelTaskBtn.disabled = !status || ['completed', 'failed', 'cancelled'].includes(status);
+    if (dom.evidenceChainBtn) dom.evidenceChainBtn.disabled = !state.currentTask;
   }
-
   function selectedTemplateIds() {
     syncTemplateSelections(false);
     return [...state.selectedTemplateIds];
@@ -1167,6 +1611,7 @@
     closeEventStream();
     disconnectLiveSpectrum();
     resetLiveSpectrum();
+    removeNodePreview(true);
     const payload = await api(`/api/capture-agent/tasks/${encodeURIComponent(taskId)}`);
     state.currentTask = payload.item;
     state.probeAutoOpenedKey = '';
@@ -1174,8 +1619,8 @@
     state.eventSeq = Number(state.currentTask.events?.at(-1)?.seq || 0);
     renderTask();
     openEventStream();
+    refreshDeviceDashboard(false).catch(() => {});
   }
-
   async function createOrReviseTask() {
     const instruction = dom.instructionInput.value.trim();
     if (!instruction || state.isSending) return;
@@ -1189,7 +1634,7 @@
         payload = await api(`/api/capture-agent/tasks/${encodeURIComponent(current.id)}/messages`, { method: 'POST', body: { content: instruction } });
         showToast(`已创建计划版本 v${payload.item.plan_version}`);
       } else {
-        payload = await api('/api/capture-agent/tasks', { method: 'POST', body: { instruction, template_ids: selectedTemplateIds(), reasoning_mode: 'deep' } });
+        payload = await api('/api/capture-agent/tasks', { method: 'POST', body: { instruction, template_ids: selectedTemplateIds(), reasoning_mode: state.reasoningModePreference } });
         showToast('任务已创建，正在生成计划');
       }
       dom.instructionInput.value = '';
@@ -1353,7 +1798,6 @@
         const event = JSON.parse(raw.data);
         state.eventSeq = Math.max(state.eventSeq, Number(event.seq || 0));
         appendLiveDelta(event);
-        handleLiveSpectrumEvent(event);
         scheduleTaskRefresh();
       } catch (_) { /* ignore malformed event */ }
     });
@@ -1375,6 +1819,7 @@
     state.refreshTimer = setTimeout(async () => {
       if (!state.currentTask) return;
       try {
+        const previousStatus = state.currentTask.status;
         const payload = await api(`/api/capture-agent/tasks/${encodeURIComponent(state.currentTask.id)}`);
         const previousCurrent = state.currentTask.current_node_id;
         state.currentTask = payload.item;
@@ -1384,6 +1829,9 @@
         if (!taskStreamActive(state.currentTask)) {
           closeEventStream();
           await refreshTaskList();
+          if (state.currentTask.status === 'completed' && previousStatus !== 'completed') {
+            await refreshDeviceDashboard(false).catch(() => {});
+          }
         } else if (!state.eventSource) {
           openEventStream();
         }
@@ -1444,6 +1892,8 @@
       syncTemplateSelections(true);
       state.tasks = tasks.items || [];
       renderRuntime(); renderTemplates(); renderTaskPicker();
+      // 页面打开先读取已有设备状态；只有点击“查询可用设备”时才强制重新探测。
+      refreshDeviceDashboard(false).catch(error => { dom.deviceQueryStatus.textContent = `设备状态读取失败：${error.message}`; });
       const consumedPending = await consumePendingDetectTask();
       if (!consumedPending) {
         const requestedTaskId = new URLSearchParams(window.location.search).get('task');
@@ -1456,6 +1906,13 @@
   }
 
   dom.taskPicker.addEventListener('change', () => selectTask(dom.taskPicker.value).catch(error => showToast(error.message, true)));
+  dom.modelModeBadge?.addEventListener('click', toggleReasoningMode);
+  dom.queryDevicesBtn?.addEventListener('click', () => refreshDeviceDashboard(true).catch(error => showToast(error.message, true)));
+  dom.evidenceChainBtn?.addEventListener('click', () => openEvidenceChain().catch(error => showToast(error.message, true)));
+  dom.closeDeviceHistoryBtn?.addEventListener('click', closeDeviceHistory);
+  dom.deviceHistoryModal?.addEventListener('click', event => { if (event.target === dom.deviceHistoryModal) closeDeviceHistory(); });
+  dom.closeEvidenceChainBtn?.addEventListener('click', closeEvidenceChain);
+  dom.evidenceChainModal?.addEventListener('click', event => { if (event.target === dom.evidenceChainModal) closeEvidenceChain(); });
   dom.newTaskBtn.addEventListener('click', newTaskMode);
   dom.renameTaskBtn.addEventListener('click', () => renameCurrentTask().catch(error => showToast(error.message, true)));
   dom.deleteTaskBtn.addEventListener('click', () => deleteCurrentTask().catch(error => showToast(error.message, true)));
@@ -1538,7 +1995,9 @@
   dom.spectrumModal.addEventListener('click', event => { if (event.target === dom.spectrumModal) closeSpectrumModal(); });
   window.addEventListener('keydown', event => {
     if (event.key !== 'Escape') return;
-    if (!dom.probeDetailModal.classList.contains('hidden')) closeProbeDetailModal();
+    if (dom.evidenceChainModal && !dom.evidenceChainModal.classList.contains('hidden')) closeEvidenceChain();
+    else if (dom.deviceHistoryModal && !dom.deviceHistoryModal.classList.contains('hidden')) closeDeviceHistory();
+    else if (!dom.probeDetailModal.classList.contains('hidden')) closeProbeDetailModal();
     else if (!dom.artifactDetailModal.classList.contains('hidden')) closeArtifactDetailModal();
     else if (!dom.probeAssistModal.classList.contains('hidden')) closeProbeAssistModal();
     else if (!dom.spectrumModal.classList.contains('hidden')) closeSpectrumModal();
@@ -1551,6 +2010,6 @@
     try { await navigator.clipboard.writeText(dom.generatedCode.textContent || ''); showToast('代码已复制'); }
     catch (_) { showToast('复制失败', true); }
   });
-  window.addEventListener('beforeunload', () => { closeEventStream(); disconnectLiveSpectrum(); closeSpectrumModal(); });
+  window.addEventListener('beforeunload', () => { closeEventStream(); disconnectLiveSpectrum(); disconnectDeviceSockets(); stopProbePolling(); closeSpectrumModal(); });
   loadInitial();
 })();

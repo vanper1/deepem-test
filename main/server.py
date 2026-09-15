@@ -43,7 +43,7 @@ app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 @app.middleware("http")
 async def no_cache_static_and_pages(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path in {"/", "/chat", "/capture-agent"} or request.url.path.startswith("/static/"):
+    if request.url.path in {"/", "/chat", "/capture-agent", "/capture-agent/node-detail"} or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
@@ -110,7 +110,7 @@ class CaptureTaskCreateIn(BaseModel):
     operator: str = "operator"
     source: str = "capture_agent"
     parent_task_id: str = ""
-    reasoning_mode: str = "deep"
+    reasoning_mode: str = "fast"
     selected_usrp_devices: list[dict[str, Any]] = Field(default_factory=list)
     selected_probe_devices: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -198,6 +198,11 @@ def chat_page() -> FileResponse:
 @app.get("/capture-agent")
 def capture_agent_page() -> FileResponse:
     return FileResponse(WEB_DIR / "capture-agent.html")
+
+
+@app.get("/capture-agent/node-detail")
+def capture_agent_node_detail_page() -> FileResponse:
+    return FileResponse(WEB_DIR / "capture-agent-node-detail.html")
 
 
 @app.get("/detect-console")
@@ -502,6 +507,24 @@ def get_capture_agent_runtime() -> JSONResponse:
     return JSONResponse({"item": capture_agent.runtime_info()})
 
 
+@app.get("/api/capture-agent/devices")
+def get_capture_agent_devices(refresh: bool = Query(default=False)) -> JSONResponse:
+    try:
+        return JSONResponse({"item": capture_agent.get_device_dashboard(refresh=refresh)})
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/capture-agent/devices/probes/{probe_id}/live")
+def get_capture_agent_probe_live(probe_id: str, page_size: int = Query(default=40, ge=1, le=100)) -> JSONResponse:
+    try:
+        return JSONResponse({"item": capture_agent.get_probe_live_snapshot(probe_id, page_size=page_size)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.get("/api/capture-agent/templates")
 def list_capture_templates() -> JSONResponse:
     return JSONResponse({"items": capture_agent.list_templates()})
@@ -591,6 +614,16 @@ def get_capture_task(task_id: str) -> JSONResponse:
         return JSONResponse({"item": capture_agent.get_task(task_id)})
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="采集任务不存在") from exc
+
+
+@app.get("/api/capture-agent/tasks/{task_id}/device-evidence-chain")
+def get_capture_task_device_evidence_chain(task_id: str) -> JSONResponse:
+    try:
+        return JSONResponse({"item": capture_agent.get_device_evidence_chain(task_id)})
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="采集任务不存在") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.put("/api/capture-agent/tasks/{task_id}/rename")

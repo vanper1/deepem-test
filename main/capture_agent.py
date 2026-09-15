@@ -32,6 +32,8 @@ from deepem.tools.autonomous_usrp import AUTONOMOUS_OUTPUT_ROOT
 from deepem.tools.base import ToolContext
 from deepem.upload_processing import docx_to_markdown
 from .probe_evidence_compaction import build_probe_evidence_pack
+from .probe_evidence_store import get_probe_evidence_store
+from .device_evidence_chain import build_device_evidence_chain
 from .capture_planner import (
     CaptureLLMPlanner,
     CapturePlanningUnavailable,
@@ -65,7 +67,10 @@ def _deepcopy_json(value: Any) -> Any:
 
 
 def _normalize_reasoning_mode(value: Any) -> str:
-    return "fast" if str(value or "").strip().lower() == "fast" else "deep"
+    normalized = str(value or "").strip().lower()
+    if normalized == "deep":
+        return "deep"
+    return "fast"
 
 
 def _initial_probe_assistance(selected_probes: list[dict[str, Any]]) -> dict[str, Any]:
@@ -296,8 +301,8 @@ class CapturePlanBuilder:
         if dwell <= 0 or dwell > 60:
             raise ValueError("单频点驻留时间必须大于 0 且不超过 60 秒")
         count = int(math.floor((stop - start) / step)) + 1
-        if count > 50000:
-            raise ValueError(f"频点数量为 {count}，超过安全上限 50000；请增大步长或缩小频率范围")
+        if count > 800000:
+            raise ValueError(f"频点数量为 {count}，超过安全上限 800000；请增大步长或缩小频率范围")
         if float(normalized["bandwidth"]) > float(normalized["sample_rate"]):
             raise ValueError("带宽不能大于采样率")
         return {
@@ -310,10 +315,12 @@ class CapturePlanBuilder:
     @classmethod
     def build_bootstrap_nodes(cls) -> list[dict[str, Any]]:
         specs = [
-            ("template_analysis", "解析采集模板", [], "解析 DOCX 的标题、段落和表格，构建发送给真实 LLM 的模板上下文。", None, "template_analysis"),
-            ("instruction_analysis", "LLM 理解采集意图", ["template_analysis"], "真实 LLM 融合模板、用户指令和规则提示，输出经过 JSON Schema 校验的结构化意图。", None, "llm_intent_analysis"),
-            ("plan_generation", "生成固定采集流程", ["instruction_analysis"], "调用标准化采集工具生成待确认参数与 plan_id，并构造固定的 B-tool 执行流程。", "prepare_spectrum_collection", "fixed_tool_plan_generation"),
-            ("approval", "等待用户批准", ["plan_generation"], "用户批准前禁止执行真实采集；批准后锁定参数、plan_id 与固定工具流程。", None, "approval_gate"),
+            ("template_analysis", "解析采集模板", [], "解析 DOCX 的标题、段落和表格，为设备判断和后续意图解析构建任务背景。", None, "template_analysis"),
+            ("device_discovery", "感知当前可用设备", ["template_analysis"], "自动探测 USRP 与 WiFi/蓝牙探针，把在线状态、能力与设备标识提供给规划器。", None, "device_discovery"),
+            ("device_selection", "LLM 自主选择采集设备", ["template_analysis", "device_discovery"], "真实 LLM 根据任务背景和可用设备清单自主决定调用 USRP、WiFi/蓝牙探针或两者组合，不使用固定设备顺序。", None, "llm_device_selection"),
+            ("instruction_analysis", "LLM 理解采集意图", ["device_selection"], "真实 LLM 融合模板、用户指令和设备选择；仅在选择 USRP 时解析完整频谱采集参数。", None, "llm_intent_analysis"),
+            ("plan_generation", "生成自适应多设备计划", ["instruction_analysis"], "按 LLM 的设备选择编排现有 USRP 内部节点和 WiFi/蓝牙探针节点，设备组顺序由任务决定。", None, "adaptive_device_plan_generation"),
+            ("approval", "等待用户批准", ["plan_generation"], "用户批准前禁止执行真实采集；批准后锁定设备选择、参数与计划指纹。", None, "approval_gate"),
         ]
         now = utc_now_iso()
         return [
@@ -354,13 +361,16 @@ class CapturePlanBuilder:
     def success_criteria(node_id: str) -> list[str]:
         criteria = {
             "template_analysis": ["全部选定 DOCX 已解析，或明确记录未上传模板"],
-            "instruction_analysis": ["真实 LLM 返回符合 Schema 的采集意图", "参数来源、假设和未决问题可追踪"],
-            "plan_generation": ["prepare_spectrum_collection 返回 plan_id", "采集参数已完成工具校验", "固定工具流程已生成并等待用户确认"],
+            "device_discovery": ["已探测 USRP 与 WiFi/蓝牙探针", "可用设备清单包含在线状态和设备标识"],
+            "device_selection": ["真实 LLM 已基于任务背景与可用设备选择设备类型", "设备选择理由可审计且不强制 USRP 优先"],
+            "instruction_analysis": ["真实 LLM 返回符合任务所需的结构化意图", "选择 USRP 时参数来源、假设和未决问题可追踪"],
+            "plan_generation": ["仅编排 LLM 选择的可用设备", "USRP 内部节点保持原流程", "探针节点使用落库+按需检索机制"],
             "approval": ["用户显式批准当前计划版本", "批准时锁定计划指纹"],
             "device_scan": ["已查询可用设备列表", "已选择空闲 USRP 设备或给出明确失败原因"],
             "collection_execution": ["execute_spectrum_collection 返回成功", "生成标准化 .npz 输出文件"],
             "output_file_check": ["输出文件存在", "输出文件扩展名为 .npz", "输出文件大小大于 0"],
-            "execution_summary": ["形成采集任务执行摘要", "任务 JSON 与 Markdown 报告均已落盘"],
+            "execution_summary": ["形成采集任务执行摘要"],
+            "report_generation": ["已生成并检查 Markdown 研判报告", "报告已融合本任务中各类设备的采集情况与证据摘要"],
         }
         return criteria.get(node_id, [])
 
@@ -405,7 +415,7 @@ class CaptureAgentService:
 
     def runtime_info(self) -> dict[str, Any]:
         info = self.planner.runtime_info()
-        return {**info, "tool_count": len(self.tool_catalog), "planning_mode": "fixed_spectrum_collection_tool_flow"}
+        return {**info, "tool_count": len(self.tool_catalog), "planning_mode": "adaptive_device_selection_with_stable_device_nodes"}
 
     def _resolve_capture_tool_definitions(self) -> dict[str, Any]:
         registry = None
@@ -548,6 +558,159 @@ class CaptureAgentService:
                     break
         return items
 
+    def get_device_dashboard(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Return live device status plus capture-agent invocation history for the middle workbench."""
+        errors: list[dict[str, str]] = []
+        try:
+            usrp_payload = dict((self.platform.scan_devices() if refresh else self.platform.list_devices()) or {})
+        except Exception as exc:
+            usrp_payload = {"devices": []}
+            errors.append({"device_type": "usrp", "message": str(exc)})
+        try:
+            adapter = self.platform.app.runtime.device_registry.find_by_capability("collect_wifi_bluetooth_probe_evidence")
+            client = getattr(adapter, "client", None) if adapter is not None else None
+            if client is None:
+                raise RuntimeError("探针适配器不可用")
+            probes = [dict(item or {}) for item in client.list_devices()]
+        except Exception as exc:
+            probes = []
+            errors.append({"device_type": "wifi_bluetooth_probe", "message": str(exc)})
+
+        with self._lock:
+            task_payloads = self._all_task_payloads_locked()
+
+        cards: list[dict[str, Any]] = []
+        for raw in usrp_payload.get("devices") or []:
+            item = dict(raw or {})
+            dev_id = str(item.get("dev_id") or item.get("id") or "usrp")
+            status = str(item.get("status") or "UNKNOWN").upper()
+            try:
+                stream_info = dict(self.platform.get_usrp_stream_info(dev_id) or {})
+            except Exception:
+                stream_info = {}
+            cards.append({
+                "device_type": "usrp",
+                "device_id": dev_id,
+                "display_name": str(item.get("name") or item.get("product") or f"USRP {dev_id}"),
+                "status": status,
+                "online": status not in {"OFFLINE", "ERROR", "UNAVAILABLE"},
+                "available_for_new_task": status in {"IDLE", "ONLINE", "READY"},
+                "details": item,
+                "stream_info": stream_info,
+                "history": self._device_invocation_history(task_payloads, "usrp", dev_id),
+            })
+        for raw in probes:
+            item = dict(raw or {})
+            probe_id = str(item.get("probe_id") or item.get("id") or "probe")
+            status = str(item.get("status") or "ONLINE").upper()
+            cards.append({
+                "device_type": "wifi_bluetooth_probe",
+                "device_id": probe_id,
+                "display_name": str(item.get("name") or item.get("label") or f"WiFi/蓝牙探针 {probe_id}"),
+                "status": status,
+                "online": status not in {"OFFLINE", "ERROR", "UNAVAILABLE"},
+                "available_for_new_task": status not in {"OFFLINE", "ERROR", "UNAVAILABLE"},
+                "details": item,
+                "history": self._device_invocation_history(task_payloads, "wifi_bluetooth_probe", probe_id),
+            })
+        cards.sort(key=lambda item: (0 if item.get("device_type") == "usrp" else 1, str(item.get("device_id") or "")))
+        return {
+            "queried_at": utc_now_iso(),
+            "refresh": bool(refresh),
+            "online_count": sum(1 for item in cards if item.get("online")),
+            "devices": cards,
+            "errors": errors + ([{"device_type": "usrp", "message": str(usrp_payload.get("scan_error") or usrp_payload.get("error"))}] if (usrp_payload.get("scan_error") or usrp_payload.get("error")) else []),
+        }
+
+    def _device_invocation_history(self, tasks: list[dict[str, Any]], device_type: str, device_id: str) -> list[dict[str, Any]]:
+        history: list[dict[str, Any]] = []
+        for task_number, task in enumerate(tasks, start=1):
+            nodes = {str(node.get("id")): node for node in task.get("nodes") or []}
+            target_node: dict[str, Any] | None = None
+            if device_type == "usrp":
+                scan = nodes.get("device_scan") or {}
+                selected = dict((scan.get("outputs") or {}).get("selected_device") or {})
+                selected_id = str(selected.get("dev_id") or "")
+                if selected_id and selected_id != device_id:
+                    continue
+                target_node = nodes.get("collection_execution")
+                if target_node is None or target_node.get("status") not in {"in_progress", "completed", "failed", "cancelled"}:
+                    continue
+                if not selected_id:
+                    selected_candidates = [str(item.get("dev_id") or "") for item in task.get("selected_usrp_devices") or []]
+                    if selected_candidates and device_id not in selected_candidates:
+                        continue
+            else:
+                target_node = nodes.get("wifi_bluetooth_probe_collection")
+                if target_node is None or target_node.get("status") not in {"in_progress", "completed", "failed", "cancelled"}:
+                    continue
+                args = dict(target_node.get("tool_arguments") or {})
+                if device_id not in [str(item) for item in args.get("probe_ids") or []]:
+                    continue
+            public_artifacts = []
+            for artifact in task.get("artifacts") or []:
+                artifact_id = str(artifact.get("id") or "")
+                item = {
+                    "id": artifact_id,
+                    "file_name": artifact.get("file_name"),
+                    "kind": artifact.get("kind"),
+                    "size_bytes": artifact.get("size_bytes"),
+                    "download_url": f"/api/capture-agent/tasks/{task.get('id')}/artifacts/{artifact_id}" if artifact_id else "",
+                }
+                if str(artifact.get("file_name") or "").lower().endswith(".npz") and artifact_id:
+                    item["spectrum_url"] = f"/api/capture-agent/tasks/{task.get('id')}/artifacts/{artifact_id}/spectrum"
+                public_artifacts.append(item)
+            outputs = dict((target_node or {}).get("outputs") or {})
+            task_title = str(task.get("title") or task.get("instruction") or task.get("id") or "采集任务")
+            history.append({
+                "task_id": task.get("id"),
+                "task_number": task_number,
+                "task_title": task_title,
+                "task_display_title": f"任务{task_number}：{task_title}",
+                "instruction": task.get("instruction") or "",
+                "task_status": task.get("status"),
+                "node_id": (target_node or {}).get("id"),
+                "node_title": (target_node or {}).get("title"),
+                "node_status": (target_node or {}).get("status"),
+                "started_at": (target_node or {}).get("started_at"),
+                "ended_at": (target_node or {}).get("ended_at"),
+                "summary": (target_node or {}).get("summary") or "",
+                "intelligent_summary": outputs.get("intelligent_summary") or task.get("latest_probe_summary") or "",
+                "evidence_set_id": outputs.get("evidence_set_id") or "",
+                "artifacts": public_artifacts,
+            })
+        history.sort(key=lambda item: str(item.get("ended_at") or item.get("started_at") or ""), reverse=True)
+        return history[:30]
+
+    def get_probe_live_snapshot(self, probe_id: str, *, page_size: int = 40) -> dict[str, Any]:
+        probe_id = str(probe_id or "").strip()
+        if not probe_id:
+            raise ValueError("probe_id 不能为空")
+        adapter = self.platform.app.runtime.device_registry.find_by_capability("collect_wifi_bluetooth_probe_evidence")
+        client = getattr(adapter, "client", None) if adapter is not None else None
+        if client is None:
+            raise RuntimeError("WiFi/蓝牙探针适配器不可用")
+        result: dict[str, Any] = {"probe_id": probe_id, "queried_at": utc_now_iso(), "items": {}, "errors": []}
+        for kind in ("wifi_ap", "wifi_client", "bluetooth"):
+            try:
+                targets = dict(client.list_targets(probe_id=probe_id, kind=kind, status="all", page=1, page_size=max(1, min(100, page_size))) or {})
+                observations = dict(client.list_observations(probe_id=probe_id, kind=kind, view="current", active_minutes=30, page=1, page_size=max(1, min(100, page_size))) or {})
+                result["items"][kind] = {
+                    "targets": list(targets.get("items") or []),
+                    "target_total": targets.get("total", len(targets.get("items") or [])),
+                    "observations": list(observations.get("items") or []),
+                    "observation_total": observations.get("total", len(observations.get("items") or [])),
+                }
+            except Exception as exc:
+                result["items"][kind] = {"targets": [], "observations": [], "target_total": 0, "observation_total": 0}
+                result["errors"].append({"kind": kind, "message": str(exc)})
+        return result
+
+    def get_device_evidence_chain(self, task_id: str) -> dict[str, Any]:
+        with self._lock:
+            task = _deepcopy_json(self._load_task_locked(task_id))
+        return build_device_evidence_chain(task, store=get_probe_evidence_store())
+
     def create_task(self, instruction: str, template_ids: list[str], metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         self.planner.ensure_available()
         instruction = str(instruction or "").strip()
@@ -572,7 +735,10 @@ class CaptureAgentService:
             "reasoning_mode": _normalize_reasoning_mode(metadata.get("reasoning_mode")),
             "selected_usrp_devices": _deepcopy_json(list(metadata.get("selected_usrp_devices") or [])),
             "selected_probe_devices": _deepcopy_json(list(metadata.get("selected_probe_devices") or [])),
-            "probe_assistance": _initial_probe_assistance(list(metadata.get("selected_probe_devices") or [])),
+            "available_devices": {},
+            "device_selection": {},
+            "probe_evidence_sets": [],
+            "probe_assistance": _initial_probe_assistance([]),
             "template_ids": [item["id"] for item in selected_templates],
             "templates": [self._public_template(item) for item in selected_templates],
             "output_dir": str(output_dir.resolve()),
@@ -891,6 +1057,9 @@ class CaptureAgentService:
             task = self._load_task_locked(task_id)
             if task.get("status") != "awaiting_approval" or task.get("plan_locked"):
                 raise ValueError("只有待批准且未锁定的任务可以修改采集参数")
+            selected_types = set((task.get("device_selection") or {}).get("selected_device_types") or [])
+            if "usrp" not in selected_types:
+                raise ValueError("当前计划未选择 USRP，没有需要修改的频谱采集参数")
             constraints = self._coerce_approval_constraints(dict(task.get("constraints") or {}), dict(parameters or {}))
             validation = CapturePlanBuilder.validate_constraints(constraints)
             task["constraints"] = constraints
@@ -902,51 +1071,16 @@ class CaptureAgentService:
             task["updated_at"] = utc_now_iso()
             self._save_task_locked(task)
 
-        prepare_result = self._prepare_spectrum_collection_plan(task_id, constraints)
-        compiled_nodes = self._fixed_collection_nodes(prepare_result)
+        # 复用同一自适应编排器：USRP 组按新 plan_id 重建，探针组与 LLM 设备选择保持不变。
+        self._generate_plan_summary(task_id)
         with self._lock:
             current = self._load_task_locked(task_id)
-            if current.get("status") != "awaiting_approval" or current.get("plan_locked"):
-                raise ValueError("计划状态已变化，参数修改未应用")
-            bootstrap_ids = {"template_analysis", "instruction_analysis", "plan_generation", "approval"}
-            bootstrap_by_id = {node["id"]: node for node in current.get("nodes", []) if node.get("id") in bootstrap_ids}
-            ordered_bootstrap = [bootstrap_by_id[node_id] for node_id in ("template_analysis", "instruction_analysis", "plan_generation", "approval") if node_id in bootstrap_by_id]
-            proposal = dict(current.get("plan_candidate") or {})
-            proposal["prepare_result"] = prepare_result
-            proposal["plan_steps_text"] = self._fixed_flow_text(compiled_nodes)
-            proposal["operator_parameter_edits"] = dict(parameters or {})
-            current["constraints"] = constraints
-            current["validation"] = validation
-            current["nodes"] = ordered_bootstrap + compiled_nodes
-            current["plan_candidate"] = proposal
-            current["approved_plan_fingerprint"] = None
-            current["plan_fingerprint"] = self._task_plan_fingerprint(current)
-            history = current.setdefault("plan_history", [])
-            if history:
-                history[-1]["proposal"] = proposal
-                history[-1]["compiled_nodes"] = [
-                    {
-                        "id": node.get("id"),
-                        "title": node.get("title"),
-                        "kind": node.get("kind"),
-                        "executor": node.get("executor"),
-                        "dependencies": node.get("dependencies", []),
-                        "tool_name": node.get("tool_name"),
-                        "tool_arguments": node.get("tool_arguments", {}),
-                        "allowed_tools": node.get("allowed_tools", []),
-                        "success_criteria": node.get("success_criteria", []),
-                        "planner_origin": node.get("planner_origin"),
-                    }
-                    for node in compiled_nodes
-                ]
-                history[-1]["plan_fingerprint"] = current["plan_fingerprint"]
-                history[-1]["operator_parameter_edits"] = dict(parameters or {})
             approval = self._node(current, "approval")
             approval.update({"status": "blocked", "progress": 0, "updated_at": utc_now_iso(), "summary": "参数已由用户修改，等待重新批准"})
-            approval["logs"].append(self._log_entry("用户在审批界面修改了采集参数，已重新生成 plan_id 与固定执行流程。", "warning", parameters))
+            approval["logs"].append(self._log_entry("用户在审批界面修改了 USRP 采集参数；已在不改变设备选择的前提下重新生成对应执行组。", "warning", parameters))
             current["current_node_id"] = "approval"
             current["updated_at"] = utc_now_iso()
-            self._append_event_locked(current, "approval_parameters_updated", "审批参数已更新，固定采集流程已重新生成。", node_id="approval", data={"validation": validation})
+            self._append_event_locked(current, "approval_parameters_updated", "USRP 审批参数已更新，自适应设备计划已重新生成。", node_id="approval", data={"validation": current.get("validation") or {}})
             self._save_task_locked(current)
         return self.get_task(task_id)
 
@@ -968,6 +1102,11 @@ class CaptureAgentService:
             if not expected_fingerprint or current_fingerprint != expected_fingerprint:
                 raise ValueError("计划结构在审批前发生变化，必须重新生成计划版本")
             node = self._node(task, "approval")
+            existing_llm_outputs = {
+                key: value
+                for key, value in dict(node.get("outputs") or {}).items()
+                if str(key).startswith("llm_")
+            }
             node.update(
                 {
                     "status": "completed",
@@ -975,15 +1114,16 @@ class CaptureAgentService:
                     "started_at": node.get("started_at") or utc_now_iso(),
                     "ended_at": utc_now_iso(),
                     "updated_at": utc_now_iso(),
-                    "summary": f"固定工具流程 v{task['plan_version']} 已由用户批准并锁定指纹",
+                    "summary": f"自适应设备计划 v{task['plan_version']} 已由用户批准并锁定指纹",
                     "outputs": {
+                        **existing_llm_outputs,
                         "approved_by": approved_by,
                         "plan_version": task["plan_version"],
                         "plan_fingerprint": expected_fingerprint,
                     },
                 }
             )
-            node["logs"].append(self._log_entry("用户批准了 B 方案固定采集流程；执行器已锁定 plan_id、节点依赖、工具名称与工具参数。", "success"))
+            node["logs"].append(self._log_entry("用户批准了自适应设备计划；执行器已锁定设备选择、节点依赖、工具名称与工具参数。", "success"))
             task["status"] = "running"
             task["pause_reason"] = None
             task["plan_locked"] = True
@@ -992,8 +1132,9 @@ class CaptureAgentService:
             task["approved_plan_fingerprint"] = expected_fingerprint
             execution_nodes = self._execution_nodes_in_order(task)
             task["current_node_id"] = execution_nodes[0]["id"] if execution_nodes else "approval"
-            self._append_event_locked(task, "plan_approved", "固定采集工具流程已批准并锁定，开始严格按依赖执行。", node_id="approval")
+            self._append_event_locked(task, "plan_approved", "自适应设备计划已批准并锁定，开始严格按依赖执行。", node_id="approval")
             self._save_task_locked(task)
+        self._schedule_status_summary(task_id, "approval", force=True, phase="node_terminal")
         self._start_worker(task_id, mode="execution")
         return self.get_task(task_id)
 
@@ -1041,6 +1182,7 @@ class CaptureAgentService:
         return self.get_task(task_id)
 
     def cancel_task(self, task_id: str) -> dict[str, Any]:
+        cancelled_node_id = ""
         with self._lock:
             task = self._load_task_locked(task_id)
             if task["status"] in TERMINAL_TASK_STATES:
@@ -1052,8 +1194,11 @@ class CaptureAgentService:
                 node = self._node(task, current)
                 if node["status"] not in TERMINAL_NODE_STATES:
                     node.update({"status": "cancelled", "ended_at": utc_now_iso(), "updated_at": utc_now_iso(), "summary": "用户取消任务"})
+                    cancelled_node_id = str(current)
             self._append_event_locked(task, "task_cancelled", "用户已取消采集任务。", node_id=current)
             self._save_task_locked(task)
+        if cancelled_node_id:
+            self._schedule_status_summary(task_id, cancelled_node_id, force=True, phase="node_terminal")
         return self.get_task(task_id)
 
     def add_message(self, task_id: str, content: str) -> dict[str, Any]:
@@ -1086,8 +1231,11 @@ class CaptureAgentService:
             task["plan_candidate"] = {}
             task["intent_analysis"] = {}
             task["constraint_sources"] = {}
+            task["available_devices"] = {}
+            task["device_selection"] = {}
+            task["probe_evidence_sets"] = []
             task["nodes"] = CapturePlanBuilder.build_bootstrap_nodes()
-            task["probe_assistance"] = _initial_probe_assistance(list(task.get("selected_probe_devices") or []))
+            task["probe_assistance"] = _initial_probe_assistance([])
             task["current_node_id"] = "template_analysis"
             self._cancel_events.setdefault(task_id, threading.Event()).clear()
             self._pause_events.setdefault(task_id, threading.Event()).clear()
@@ -1354,6 +1502,7 @@ class CaptureAgentService:
             else:
                 self._run_execution(task_id)
         except Exception as exc:
+            failed_node_id = ""
             with self._lock:
                 try:
                     task = self._load_task_locked(task_id)
@@ -1375,13 +1524,16 @@ class CaptureAgentService:
                             }
                         )
                         node["logs"].append(self._log_entry(str(exc), "error"))
+                        failed_node_id = str(current)
                 task["status"] = "failed"
                 task["error"] = str(exc)
                 self._append_event_locked(task, "task_failed", f"任务失败：{exc}", node_id=current, level="error")
                 self._save_task_locked(task)
+            if failed_node_id:
+                self._schedule_status_summary(task_id, failed_node_id, force=True, phase="node_terminal")
 
     def _run_planning(self, task_id: str) -> None:
-        planning_nodes = ["template_analysis", "instruction_analysis", "plan_generation"]
+        planning_nodes = ["template_analysis", "device_discovery", "device_selection", "instruction_analysis", "plan_generation"]
         for node_id in planning_nodes:
             if self._should_stop(task_id):
                 return
@@ -1396,15 +1548,22 @@ class CaptureAgentService:
                 self._assert_dependencies(task, node)
                 self._begin_node_locked(task, node, f"开始{node['title']}。")
                 self._save_task_locked(task)
+            self._schedule_status_summary(task_id, node_id, force=True, phase="node_started")
             if node_id == "template_analysis":
                 output = self._analyze_templates(task_id)
                 self._complete_node(task_id, node_id, "模板解析完成。", output)
+            elif node_id == "device_discovery":
+                output = self._discover_collection_devices(task_id, refresh_usrp=True)
+                self._complete_node(task_id, node_id, "可用设备探测完成。", output)
+            elif node_id == "device_selection":
+                output = self._select_collection_devices(task_id)
+                self._complete_node(task_id, node_id, "设备自主选择完成。", output)
             elif node_id == "instruction_analysis":
                 output = self._analyze_instruction(task_id)
-                self._complete_node(task_id, node_id, "采集约束提取完成。", output)
+                self._complete_node(task_id, node_id, "采集意图与所需参数解析完成。", output)
             else:
                 output = self._generate_plan_summary(task_id)
-                self._complete_node(task_id, node_id, "结构化任务规划已生成。", output)
+                self._complete_node(task_id, node_id, "自适应多设备任务规划已生成。", output)
 
         with self._lock:
             task = self._load_task_locked(task_id)
@@ -1417,16 +1576,17 @@ class CaptureAgentService:
                     "status": "blocked",
                     "progress": 0,
                     "updated_at": utc_now_iso(),
-                    "summary": f"等待用户批准固定采集流程 v{task['plan_version']}",
+                    "summary": f"等待用户批准自适应设备计划 v{task['plan_version']}",
                     "inputs": {"plan_version": task["plan_version"], "requires_explicit_approval": True},
                 }
             )
-            approval["logs"].append(self._log_entry("批准前，execute_spectrum_collection 被状态机阻止；prepare 阶段不会启动真实采集。", "warning"))
+            approval["logs"].append(self._log_entry("批准前，所有真实 USRP / WiFi蓝牙探针采集节点都被状态机阻止。", "warning"))
             task["status"] = "awaiting_approval"
             task["current_node_id"] = "approval"
             task["progress"] = self._task_progress(task)
-            self._append_event_locked(task, "plan_ready", "采集参数与固定工具流程已生成，请检查后批准执行。", node_id="approval")
+            self._append_event_locked(task, "plan_ready", "设备选择与自适应采集计划已生成，请检查后批准执行。", node_id="approval")
             self._save_task_locked(task)
+        self._schedule_status_summary(task_id, "approval", force=True, phase="node_started")
 
     def _run_execution(self, task_id: str) -> None:
         while True:
@@ -1448,22 +1608,25 @@ class CaptureAgentService:
                     task["pause_reason"] = None
                     task["progress"] = 100
                     task["current_node_id"] = execution_nodes[-1]["id"] if execution_nodes else "approval"
+                    selected_types = list((task.get("device_selection") or {}).get("selected_device_types") or [])
                     task["messages"].append(
                         {
                             "id": f"msg_{uuid4().hex[:10]}",
                             "role": "assistant",
-                            "content": "任务已按 B 方案固定采集工具流程完成，任务目录中的结果与审计文件已统一保存。",
+                            "content": "任务已按智能体自主选择的设备计划完成，结果、探针证据索引与审计文件已统一保存。",
                             "created_at": utc_now_iso(),
                             "template_ids": [],
                         }
                     )
-                    self._append_event_locked(task, "task_completed", "固定采集工具流程的所有节点均已完成，统一任务目录已写入审计产物。", node_id=task["current_node_id"])
-                    auxiliary = task.setdefault("probe_assistance", _initial_probe_assistance(list(task.get("selected_probe_devices") or [])))
-                    if auxiliary.get("enabled") and auxiliary.get("status") in {"waiting_for_usrp", "queued"}:
-                        auxiliary["status"] = "awaiting_confirmation"
-                        auxiliary["status_label"] = "等待确认调用 WiFi/蓝牙探针"
-                        self._set_probe_step(auxiliary, "confirm", "pending", "USRP 采集已完成，请确认是否获取更多辅助信息")
-                        self._append_event_locked(task, "probe_assistance_confirmation_required", "USRP 采集已完成，请确认是否调用 WiFi/蓝牙探针获取更多信息。")
+                    self._append_event_locked(
+                        task,
+                        "task_completed",
+                        "自适应设备计划的所有节点均已完成，统一任务目录已写入审计产物。",
+                        node_id=task["current_node_id"],
+                        data={"selected_device_types": selected_types},
+                    )
+                    # 旧版“USRP 完成后再确认探针”流程保留兼容 API，但自适应计划不再自动触发。
+                    task["probe_assistance"] = _initial_probe_assistance([])
                     self._save_task_locked(task)
                     return
 
@@ -1481,6 +1644,7 @@ class CaptureAgentService:
                 node_id = node["id"]
                 self._begin_node_locked(task, node, f"开始{node['title']}。")
                 self._save_task_locked(task)
+            self._schedule_status_summary(task_id, node_id, force=True, phase="node_started")
 
             max_attempts = max(1, min(3, int(node.get("max_attempts") or 2)))
             completed = False
@@ -1522,7 +1686,9 @@ class CaptureAgentService:
                             retry_node = self._node(current, node_id)
                             self._begin_node_locked(current, retry_node, f"重试{retry_node['title']}。")
                             self._save_task_locked(current)
+                        self._schedule_status_summary(task_id, node_id, force=True, phase="node_started")
                         continue
+                    self._schedule_status_summary(task_id, node_id, force=True, phase="node_terminal")
                     return
             if not completed:
                 return
@@ -1537,6 +1703,8 @@ class CaptureAgentService:
             return self._execute_output_file_check(task_id, node_id)
         if executor == "execution_summary":
             return self._execute_execution_summary(task_id, node_id)
+        if executor == "report_generation":
+            return self._execute_report_generation(task_id, node_id)
         kind = str(node.get("kind") or node.get("executor") or "")
         if kind == "tool_call":
             return self._execute_freeform_tool_node(task_id, node_id)
@@ -1606,6 +1774,29 @@ class CaptureAgentService:
         args, resolution_notes = self._resolve_tool_arguments(tool_name, raw_args, task, node)
         output = self._execute_tool(task_id, node_id, tool_name, args)
 
+        probe_summary = ""
+        probe_set_meta: dict[str, Any] | None = None
+        if tool_name == "collect_wifi_bluetooth_probe_evidence":
+            evidence_set_id = str(output.get("evidence_set_id") or "")
+            if evidence_set_id:
+                probe_set_meta = get_probe_evidence_store().get_set(evidence_set_id)
+            try:
+                probe_summary = self.planner.summarize_probe_evidence(
+                    task_context={
+                        "id": task.get("id"),
+                        "instruction": task.get("instruction"),
+                        "device_selection": task.get("device_selection") or {},
+                        "constraints": task.get("constraints") or {},
+                    },
+                    evidence=dict(output.get("llm_evidence") or {}),
+                    reasoning_mode=_normalize_reasoning_mode(task.get("reasoning_mode")),
+                    stream_handler=self._planner_stream_handler(task_id, node_id),
+                    cancel_checker=lambda: self._should_stop(task_id),
+                )
+            except Exception as exc:
+                probe_summary = f"探针证据已成功采集并落库，但智能摘要生成失败：{exc}"
+            output["intelligent_summary"] = probe_summary
+
         with self._lock:
             current = self._load_task_locked(task_id)
             current_node = self._node(current, node_id)
@@ -1625,6 +1816,22 @@ class CaptureAgentService:
                 output_file = output.get("output_file")
                 if output_file:
                     self._add_artifact_locked(current, Path(str(output_file)), "collection_result")
+            if tool_name == "collect_wifi_bluetooth_probe_evidence":
+                evidence_set_id = str(output.get("evidence_set_id") or "")
+                if probe_set_meta and probe_set_meta.get("raw_json_path"):
+                    self._add_artifact_locked(current, Path(str(probe_set_meta["raw_json_path"])), "probe_evidence_raw")
+                history = list(current.get("probe_evidence_sets") or [])
+                history = [item for item in history if item.get("evidence_set_id") != evidence_set_id]
+                history.append({
+                    "evidence_set_id": evidence_set_id,
+                    "created_at": (probe_set_meta or {}).get("created_at") or utc_now_iso(),
+                    "counts": output.get("counts") or {},
+                    "overview": output.get("overview") or {},
+                    "manifest": output.get("manifest") or {},
+                    "intelligent_summary": probe_summary,
+                })
+                current["probe_evidence_sets"] = history[-20:]
+                current["latest_probe_summary"] = probe_summary
             for path in self._discover_output_files(output):
                 self._add_artifact_locked(current, path, "tool_output")
             self._save_task_locked(current)
@@ -1634,6 +1841,14 @@ class CaptureAgentService:
             summary = (
                 f"标准频谱采集完成：成功 {output.get('success_count', '-')} / "
                 f"{output.get('freq_count', '-')} 个频点，输出 {Path(str(output.get('output_file') or '')).name or '-'}。"
+            )
+        if tool_name == "collect_wifi_bluetooth_probe_evidence":
+            counts = dict(output.get("counts") or {})
+            by_kind = dict(counts.get("by_kind") or {})
+            summary = (
+                f"WiFi/蓝牙探针采集完成并落库：热点 {((by_kind.get('wifi_ap') or {}).get('targets', 0))}、"
+                f"WiFi客户端 {((by_kind.get('wifi_client') or {}).get('targets', 0))}、"
+                f"蓝牙 {((by_kind.get('bluetooth') or {}).get('targets', 0))} 个目标，证据集 {output.get('evidence_set_id') or '-'}。"
             )
         if isinstance(output.get("execution_result"), dict):
             execution = output["execution_result"]
@@ -2078,12 +2293,159 @@ class CaptureAgentService:
             combined.append(f"# 模板：{template['file_name']}\n{template.get('markdown', '')}")
         return {"template_count": len(items), "items": items, "combined_markdown": "\n\n".join(combined)[:50000]}
 
+    def _discover_collection_devices(self, task_id: str, *, refresh_usrp: bool = True) -> dict[str, Any]:
+        """Discover real acquisition devices before the LLM chooses a workflow."""
+        usrp_payload: dict[str, Any] = {}
+        probe_devices: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        try:
+            usrp_payload = dict((self.platform.scan_devices() if refresh_usrp else self.platform.list_devices()) or {})
+        except Exception as exc:
+            errors.append({"device_type": "usrp", "message": str(exc)})
+            usrp_payload = {"devices": []}
+
+        try:
+            adapter = self.platform.app.runtime.device_registry.find_by_capability("collect_wifi_bluetooth_probe_evidence")
+            client = getattr(adapter, "client", None) if adapter is not None else None
+            if client is None or not callable(getattr(client, "list_devices", None)):
+                raise RuntimeError("WiFi/蓝牙探针适配器未注册或不支持设备列表")
+            probe_devices = [dict(item or {}) for item in client.list_devices()]
+        except Exception as exc:
+            errors.append({"device_type": "wifi_bluetooth_probe", "message": str(exc)})
+
+        usrp_devices: list[dict[str, Any]] = []
+        for raw in list(usrp_payload.get("devices") or []):
+            item = dict(raw or {})
+            status = str(item.get("status") or "UNKNOWN").upper()
+            item["device_type"] = "usrp"
+            item["online"] = status not in {"OFFLINE", "ERROR", "UNAVAILABLE"}
+            item["available_for_new_task"] = status in {"IDLE", "ONLINE", "READY"}
+            usrp_devices.append(item)
+
+        normalized_probes: list[dict[str, Any]] = []
+        for raw in probe_devices:
+            item = dict(raw or {})
+            status = str(item.get("status") or "ONLINE").upper()
+            item["device_type"] = "wifi_bluetooth_probe"
+            item["online"] = status not in {"OFFLINE", "ERROR", "UNAVAILABLE"}
+            item["available_for_new_task"] = bool(item["online"])
+            normalized_probes.append(item)
+
+        inventory = {
+            "scanned_at": utc_now_iso(),
+            "usrp": {
+                "devices": usrp_devices,
+                "online_count": sum(1 for item in usrp_devices if item.get("online")),
+                "available_count": sum(1 for item in usrp_devices if item.get("available_for_new_task")),
+                "error": usrp_payload.get("scan_error") or usrp_payload.get("error"),
+            },
+            "wifi_bluetooth_probe": {
+                "devices": normalized_probes,
+                "online_count": sum(1 for item in normalized_probes if item.get("online")),
+                "available_count": sum(1 for item in normalized_probes if item.get("available_for_new_task")),
+            },
+            "errors": errors,
+        }
+        inventory["available_device_types"] = [
+            device_type
+            for device_type in ("usrp", "wifi_bluetooth_probe")
+            if int((inventory.get(device_type) or {}).get("available_count") or 0) > 0
+        ]
+        with self._lock:
+            current = self._load_task_locked(task_id)
+            current["available_devices"] = inventory
+            self._save_task_locked(current)
+        return inventory
+
+    def _select_collection_devices(self, task_id: str) -> dict[str, Any]:
+        with self._lock:
+            task = self._load_task_locked(task_id)
+            template_markdown = str((self._node(task, "template_analysis").get("outputs") or {}).get("combined_markdown") or "")
+            inventory = _deepcopy_json(task.get("available_devices") or {})
+            instruction = str(task.get("instruction") or "")
+            reasoning_mode = _normalize_reasoning_mode(task.get("reasoning_mode"))
+        available_types = set(inventory.get("available_device_types") or [])
+        if not available_types:
+            errors = inventory.get("errors") or []
+            raise RuntimeError(f"当前没有可用于新采集任务的设备：{errors or 'USRP/探针均未在线或忙碌'}")
+        result = self.planner.select_devices(
+            instruction=instruction,
+            template_markdown=template_markdown,
+            available_devices=inventory,
+            reasoning_mode=reasoning_mode,
+            stream_handler=self._planner_stream_handler(task_id, "device_selection"),
+            cancel_checker=lambda: self._should_stop(task_id),
+        )
+        proposal = dict(result.get("proposal") or {})
+        selected = [str(item) for item in proposal.get("selected_device_types") or []]
+        unavailable = [item for item in selected if item not in available_types]
+        if unavailable:
+            raise RuntimeError(f"设备规划器选择了当前不可用设备：{', '.join(unavailable)}")
+        if not selected:
+            raise RuntimeError("设备规划器未选择任何可用采集设备")
+        if "wifi_bluetooth_probe" in selected and not proposal.get("probe_kinds"):
+            proposal["probe_kinds"] = ["wifi_ap", "wifi_client", "bluetooth"]
+        selected_usrp = [item for item in (inventory.get("usrp") or {}).get("devices", []) if item.get("available_for_new_task")] if "usrp" in selected else []
+        selected_probes = [item for item in (inventory.get("wifi_bluetooth_probe") or {}).get("devices", []) if item.get("available_for_new_task")] if "wifi_bluetooth_probe" in selected else []
+        with self._lock:
+            current = self._load_task_locked(task_id)
+            current["device_selection"] = proposal
+            current["selected_usrp_devices"] = _deepcopy_json(selected_usrp)
+            current["selected_probe_devices"] = _deepcopy_json(selected_probes)
+            current["planner"] = result.get("model") or self.planner.runtime_info()
+            self._append_event_locked(
+                current,
+                "capture_devices_selected",
+                "智能体已根据任务背景与在线设备自主选择：" + "、".join(selected),
+                node_id="device_selection",
+                data={"selected_device_types": selected, "rationale": proposal.get("rationale") or {}},
+            )
+            self._save_task_locked(current)
+        return {
+            "device_selection": proposal,
+            "available_device_types": sorted(available_types),
+            "selected_usrp_devices": selected_usrp,
+            "selected_probe_devices": selected_probes,
+            "model": result.get("model"),
+            "raw_model_output": result.get("raw_model_output"),
+        }
+
     def _analyze_instruction(self, task_id: str) -> dict[str, Any]:
         with self._lock:
             task = self._load_task_locked(task_id)
             template_output = dict(self._node(task, "template_analysis").get("outputs") or {})
             template_markdown = str(template_output.get("combined_markdown") or "")
             previous_analysis = dict(task.get("intent_analysis") or {})
+
+        selected_types = set((task.get("device_selection") or {}).get("selected_device_types") or [])
+        if "usrp" not in selected_types:
+            selection = dict(task.get("device_selection") or {})
+            proposal = {
+                "objective": selection.get("objective") or task["instruction"],
+                "task_summary": selection.get("background_summary") or task["instruction"],
+                "constraints": {},
+                "assumptions": [],
+                "unresolved_questions": list(selection.get("unavailable_requirements") or []),
+                "source_trace": {},
+                "risk_notes": [],
+                "device_selection": selection,
+            }
+            with self._lock:
+                current = self._load_task_locked(task_id)
+                current["constraints"] = {}
+                current["constraint_sources"] = {}
+                current["validation"] = {"device_mode": "probe_only", "frequency_count": 0, "estimated_capture_seconds": 0}
+                current["intent_analysis"] = proposal
+                current["parameter_resolution_policy"] = "未选择 USRP，不生成无关频谱采集参数；探针参数来自设备选择节点。"
+                self._save_task_locked(current)
+            return {
+                "intent_analysis": proposal,
+                "constraints": {},
+                "constraint_sources": {},
+                "validation": current["validation"],
+                "parameter_resolution_policy": current["parameter_resolution_policy"],
+                "sources": ["用户指令", "DOCX 模板", "设备选择结果"],
+            }
 
         user_explicit = CapturePlanBuilder.extract_constraints(task["instruction"], "")
         template_explicit = CapturePlanBuilder.extract_constraints("", template_markdown)
@@ -2093,6 +2455,8 @@ class CaptureAgentService:
                 "仅对用户和模板均未指定的字段，根据本次任务意图设计合适参数。"
             ),
             "required_fields": list(CapturePlanBuilder.REQUIRED_CONSTRAINT_KEYS),
+            "usrp_device_parameter_ranges": self.planner.usrp_parameter_context()["ranges"],
+            "usrp_parameter_relationships": self.planner.usrp_parameter_context()["relationships"],
             "user_explicit_constraints": user_explicit,
             "template_explicit_constraints": template_explicit,
             "template_uploaded": bool(template_markdown.strip()),
@@ -2156,26 +2520,154 @@ class CaptureAgentService:
             "sources": ["用户明确参数", "DOCX 模板明确参数", "真实 LLM 按任务意图设计的其余参数"],
         }
 
+    def _probe_collection_nodes(self, task: dict[str, Any], dependency: str = "approval") -> list[dict[str, Any]]:
+        selection = dict(task.get("device_selection") or {})
+        probes = list(task.get("selected_probe_devices") or [])
+        probe_ids = [str(item.get("probe_id") or "").strip() for item in probes if str(item.get("probe_id") or "").strip()]
+        if not probe_ids:
+            raise RuntimeError("设备规划选择了 WiFi/蓝牙探针，但当前没有可用 probe_id")
+        kinds = [item for item in selection.get("probe_kinds") or [] if item in {"wifi_ap", "wifi_client", "bluetooth"}]
+        if not kinds:
+            kinds = ["wifi_ap", "wifi_client", "bluetooth"]
+        now = utc_now_iso()
+        return [{
+            "id": "wifi_bluetooth_probe_collection",
+            "title": "采集 WiFi/蓝牙探针信息",
+            "description": "调用在线 WiFi/蓝牙探针获取热点、WiFi 客户端和蓝牙设备线索；完整结果先落 JSON + SQLite 索引，节点上下文只保留有界摘要，后续可按需检索。",
+            "executor": "tool_call",
+            "kind": "tool_call",
+            "dependencies": [dependency],
+            "tool_name": "collect_wifi_bluetooth_probe_evidence",
+            "tool_arguments": {
+                "probe_ids": probe_ids,
+                "kinds": kinds,
+                "active_minutes": int(selection.get("active_minutes") or 30),
+                "page_size": 200,
+                "capture_task_id": str(task.get("id") or ""),
+            },
+            "allowed_tool": "collect_wifi_bluetooth_probe_evidence",
+            "allowed_tools": ["collect_wifi_bluetooth_probe_evidence", "query_probe_evidence"],
+            "status": "pending",
+            "progress": 0,
+            "attempts": 0,
+            "started_at": None,
+            "ended_at": None,
+            "updated_at": now,
+            "summary": "等待执行",
+            "success_criteria": [
+                "探针接口调用完成并返回有界证据摘要",
+                "完整探针结果已落库并生成 evidence_set_id",
+                "可通过 query_probe_evidence 按需检索详细设备记录",
+            ],
+            "expected_evidence": ["WiFi 热点", "WiFi 客户端", "蓝牙设备", "探针证据集索引"],
+            "tool_input_overrides": {},
+            "risk_level": "low",
+            "planner_origin": "adaptive_device_selection",
+            "inputs": {},
+            "outputs": {},
+            "logs": [],
+            "notes": "",
+        }]
+
+    def _report_generation_node(self, dependency: str) -> dict[str, Any]:
+        now = utc_now_iso()
+        return {
+            "id": "report_generation",
+            "title": "研判报告生成",
+            "description": "检查并整理任务 Markdown 报告，融合本任务实际调用的 USRP、WiFi/蓝牙探针及对应采集结果、证据集与执行状态。",
+            "executor": "report_generation",
+            "kind": "system_summary",
+            "dependencies": [dependency],
+            "tool_name": None,
+            "tool_arguments": {},
+            "allowed_tool": None,
+            "allowed_tools": [],
+            "status": "pending",
+            "progress": 0,
+            "attempts": 0,
+            "started_at": None,
+            "ended_at": None,
+            "updated_at": now,
+            "summary": "等待生成研判报告",
+            "success_criteria": CapturePlanBuilder.success_criteria("report_generation"),
+            "expected_evidence": ["Markdown 研判报告", "各设备采集情况汇总"],
+            "tool_input_overrides": {},
+            "risk_level": "low",
+            "planner_origin": "system_report_finalization",
+            "inputs": {},
+            "outputs": {},
+            "logs": [],
+            "notes": "",
+        }
+
+    @staticmethod
+    def _bootstrap_node_ids() -> tuple[str, ...]:
+        return ("template_analysis", "device_discovery", "device_selection", "instruction_analysis", "plan_generation", "approval")
+
     def _generate_plan_summary(self, task_id: str) -> dict[str, Any]:
         with self._lock:
             task = self._load_task_locked(task_id)
             instruction = task["instruction"]
-            intent_analysis = dict(task.get("intent_analysis") or {})
             constraints = dict(task.get("constraints") or {})
-            validation = dict(task.get("validation") or {})
             plan_version = int(task.get("plan_version") or 1)
-        prepare_result = self._prepare_spectrum_collection_plan(task_id, constraints)
-        compiled_nodes = self._fixed_collection_nodes(prepare_result)
+            selection = dict(task.get("device_selection") or {})
+            selected_types = [str(item) for item in selection.get("selected_device_types") or []]
+
+        if not selected_types:
+            raise RuntimeError("缺少设备选择结果，无法生成采集计划")
+
+        prepare_result: dict[str, Any] | None = None
+        usrp_nodes: list[dict[str, Any]] = []
+        if "usrp" in selected_types:
+            prepare_result = self._prepare_spectrum_collection_plan(task_id, constraints)
+            usrp_nodes = self._fixed_collection_nodes(prepare_result)
+
+        with self._lock:
+            task_snapshot = self._load_task_locked(task_id)
+        probe_nodes = self._probe_collection_nodes(task_snapshot) if "wifi_bluetooth_probe" in selected_types else []
+
+        groups: dict[str, list[dict[str, Any]]] = {
+            "usrp": usrp_nodes,
+            "wifi_bluetooth_probe": probe_nodes,
+        }
+        compiled_nodes: list[dict[str, Any]] = []
+        previous_last = "approval"
+        for device_type in selected_types:
+            group = groups.get(device_type) or []
+            if not group:
+                continue
+            first = group[0]
+            # 只改变设备组之间的根依赖；USRP 组内部 device_scan -> collection -> check -> summary 完全保持不变。
+            original_first_dependencies = list(first.get("dependencies") or [])
+            if original_first_dependencies == ["approval"] or first.get("id") == "wifi_bluetooth_probe_collection":
+                first["dependencies"] = [previous_last]
+            compiled_nodes.extend(group)
+            previous_last = str(group[-1].get("id"))
+
+        if not compiled_nodes:
+            raise RuntimeError("设备选择结果没有产生任何可执行采集节点")
+
+        # 所有设备采集完成后统一进入显式的“研判报告生成”节点。
+        # 该节点只整理已有采集结果与 report.md，不再触发新的真实设备调用。
+        compiled_nodes.append(self._report_generation_node(previous_last))
+
+        device_labels = {"usrp": "USRP", "wifi_bluetooth_probe": "WiFi/蓝牙探针"}
+        ordered_labels = [device_labels.get(item, item) for item in selected_types]
+        completion_contract = [
+            "仅执行设备选择节点选中的可用设备，不机械调用未选择设备",
+            "所有真实采集节点仅在用户批准后执行",
+            "USRP 被选中时保持原标准频谱采集节点内部流程不变",
+            "探针被选中时完整设备列表先落库索引，模型只接收有界摘要并支持按需检索",
+            "全部设备采集结束后执行研判报告生成，报告融合各设备采集情况并检查 Markdown 文件有效性",
+            "最终产物与证据均进入任务审计记录",
+        ]
         proposal = {
-            "objective": f"按标准化频谱采集工具完成：{instruction}",
-            "strategy_summary": "平台固定调用 B 方案采集 tool：批准后执行采集、检查输出 .npz 文件、生成任务执行摘要。",
-            "completion_contract": [
-                "仅在用户批准后调用 execute_spectrum_collection",
-                "输出文件检查只验证存在、扩展名 .npz、大小大于 0",
-                "最后输出采集任务执行摘要和审计报告",
-            ],
-            "fixed_tool_flow": True,
-            "prepare_result": prepare_result,
+            "objective": selection.get("objective") or f"按任务背景完成采集：{instruction}",
+            "strategy_summary": "规划器先感知在线设备，再由真实 LLM 自主选择设备。当前设备组执行顺序：" + " → ".join(ordered_labels) + "。",
+            "completion_contract": completion_contract,
+            "adaptive_device_flow": True,
+            "device_selection": selection,
+            "prepare_result": prepare_result or {},
             "plan_steps_text": self._fixed_flow_text(compiled_nodes),
         }
         fingerprint = self.planner.plan_fingerprint(
@@ -2183,14 +2675,28 @@ class CaptureAgentService:
             constraints=constraints,
             plan_version=plan_version,
             objective=proposal["objective"],
-            completion_contract=proposal["completion_contract"],
+            completion_contract=completion_contract,
         )
+        compiled_public = [
+            {
+                "id": node.get("id"),
+                "title": node.get("title"),
+                "kind": node.get("kind"),
+                "executor": node.get("executor"),
+                "dependencies": node.get("dependencies", []),
+                "tool_name": node.get("tool_name"),
+                "tool_arguments": node.get("tool_arguments", {}),
+                "allowed_tools": node.get("allowed_tools", []),
+                "success_criteria": node.get("success_criteria", []),
+                "planner_origin": node.get("planner_origin"),
+            }
+            for node in compiled_nodes
+        ]
         with self._lock:
             current = self._load_task_locked(task_id)
-            bootstrap_ids = {"template_analysis", "instruction_analysis", "plan_generation", "approval"}
-            bootstrap_nodes = [node for node in current.get("nodes", []) if node.get("id") in bootstrap_ids]
-            bootstrap_by_id = {node["id"]: node for node in bootstrap_nodes}
-            ordered_bootstrap = [bootstrap_by_id[node_id] for node_id in ("template_analysis", "instruction_analysis", "plan_generation", "approval")]
+            bootstrap_ids = set(self._bootstrap_node_ids())
+            bootstrap_by_id = {node["id"]: node for node in current.get("nodes", []) if node.get("id") in bootstrap_ids}
+            ordered_bootstrap = [bootstrap_by_id[node_id] for node_id in self._bootstrap_node_ids() if node_id in bootstrap_by_id]
             current["nodes"] = ordered_bootstrap + compiled_nodes
             current["plan_candidate"] = proposal
             current["plan_fingerprint"] = fingerprint
@@ -2201,54 +2707,39 @@ class CaptureAgentService:
                 "created_at": utc_now_iso(),
                 "model": current["planner"],
                 "proposal": proposal,
-                "compiled_nodes": [
-                    {
-                        "id": node.get("id"),
-                        "title": node.get("title"),
-                        "kind": node.get("kind"),
-                        "executor": node.get("executor"),
-                        "dependencies": node.get("dependencies", []),
-                        "tool_name": node.get("tool_name"),
-                        "tool_arguments": node.get("tool_arguments", {}),
-                        "allowed_tools": node.get("allowed_tools", []),
-                        "success_criteria": node.get("success_criteria", []),
-                        "planner_origin": node.get("planner_origin"),
-                    }
-                    for node in compiled_nodes
-                ],
+                "compiled_nodes": compiled_public,
                 "plan_fingerprint": fingerprint,
                 "raw_model_output": "",
             }
             current.setdefault("plan_history", []).append(history_entry)
             self._append_event_locked(
                 current,
-                "fixed_tool_plan_compiled",
-                f"已基于 B 方案工具生成 {len(compiled_nodes)} 个固定执行节点，等待用户确认参数并批准执行。",
+                "adaptive_device_plan_compiled",
+                f"已根据 LLM 设备选择生成 {len(compiled_nodes)} 个执行节点：{' → '.join(ordered_labels)}，等待用户批准。",
                 node_id="plan_generation",
-                data={"plan_version": plan_version, "plan_fingerprint": fingerprint},
+                data={"plan_version": plan_version, "plan_fingerprint": fingerprint, "selected_device_types": selected_types},
             )
             self._save_task_locked(current)
         return {
-            "objective": proposal.get("objective") or instruction,
-            "strategy_summary": proposal.get("strategy_summary"),
+            "objective": proposal["objective"],
+            "strategy_summary": proposal["strategy_summary"],
             "plan_version": plan_version,
             "locked_after_approval": True,
             "plan_fingerprint": fingerprint,
             "model": self.planner.runtime_info(),
-            "llm_candidate": proposal,
-            "compiled_nodes": history_entry["compiled_nodes"],
+            "device_selection": selection,
+            "compiled_nodes": compiled_public,
             "validator_summary": {
                 "candidate_node_count": len(compiled_nodes),
                 "executable_node_count": len(compiled_nodes),
-                "inserted_nodes": [],
                 "dag_validated": True,
                 "tool_references_validated": True,
                 "approval_gate_bound_to_roots": True,
-                "workflow_template_used": True,
-                "workflow_template": "B方案 prepare_spectrum_collection + execute_spectrum_collection",
+                "workflow_template_used": False,
+                "workflow_mode": "adaptive device groups / stable device-internal nodes",
             },
-            "completion_contract": proposal.get("completion_contract") or [],
-            "prepare_result": prepare_result,
+            "completion_contract": completion_contract,
+            "prepare_result": prepare_result or {},
             "plan_steps_text": proposal["plan_steps_text"],
             "raw_model_output": "",
         }
@@ -2712,6 +3203,30 @@ class CaptureAgentService:
             )
             self._save_task_locked(task)
         return summary, "采集任务执行摘要已生成。"
+
+    def _execute_report_generation(self, task_id: str, node_id: str) -> tuple[dict[str, Any], str]:
+        with self._lock:
+            task = self._load_task_locked(task_id)
+            output_dir = Path(str(task.get("output_dir") or (AUTONOMOUS_OUTPUT_ROOT / task["id"]))).resolve()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            report_path = output_dir / f"{task['id']}_report.md"
+            report_text = self._render_markdown_report(task)
+            report_path.write_text(report_text, encoding="utf-8")
+            if not report_path.exists() or report_path.stat().st_size <= 0:
+                raise RuntimeError("研判报告生成后检查失败：Markdown 报告文件不存在或为空")
+            device_snapshot = self._device_collection_snapshot(task)
+            artifact = self._add_artifact_locked(task, report_path, "audit_markdown")
+            result = {
+                "status": "passed",
+                "report_file": str(report_path),
+                "file_name": report_path.name,
+                "size_bytes": report_path.stat().st_size,
+                "device_collection": device_snapshot,
+                "artifact_id": artifact.get("id"),
+            }
+            task["report_generation"] = result
+            self._save_task_locked(task)
+        return result, f"研判报告已生成并检查通过：{report_path.name}，已融合各设备采集情况。"
 
     # ---------- tool bridge ----------
     def _execute_tool(self, task_id: str, node_id: str, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -3200,17 +3715,53 @@ class CaptureAgentService:
         return handler
 
     def _schedule_status_summary(self, task_id: str, node_id: str, *, force: bool = False, phase: str = "") -> None:
-        """Queue a coalesced, model-generated live status summary for one node."""
+        """Queue lifecycle summaries and coalesced live summaries for one node.
+
+        Lifecycle summaries are requested exactly once for node start and node end.
+        Stream-driven live summaries are throttled, SHA1-deduplicated, and coalesced
+        so a busy node keeps only the newest pending snapshot while one worker runs.
+        """
+        phase_name = str(phase or "").strip().lower()
+        if phase_name == "node_started":
+            summary_kind = "start"
+            lifecycle_phase = "start"
+            model_phase = "node_started"
+        elif phase_name in {"node_terminal", "node_completed", "node_failed", "node_cancelled"}:
+            summary_kind = "end"
+            lifecycle_phase = "end"
+            model_phase = "node_terminal"
+        else:
+            summary_kind = "live"
+            lifecycle_phase = ""
+            model_phase = phase_name or "live"
+
         try:
             with self._lock:
                 task = self._load_task_locked(task_id)
                 node = self._node(task, node_id)
-                outputs = dict(node.get("outputs") or {})
+                outputs = node.setdefault("outputs", {})
+
+                if lifecycle_phase:
+                    requested = [str(item) for item in outputs.get("llm_status_summary_requested_phases") or []]
+                    if lifecycle_phase in requested:
+                        return
+                    requested.append(lifecycle_phase)
+                    outputs["llm_status_summary_requested_phases"] = requested
+
                 reasoning = str(outputs.get("llm_reasoning") or "")
                 structured = str(outputs.get("llm_live_output") or "")
+                if summary_kind == "end" and not structured:
+                    output_keys = [
+                        str(key)
+                        for key in outputs.keys()
+                        if not str(key).startswith("llm_")
+                    ][:24]
+                    structured = "final_output_keys=" + ", ".join(output_keys)
+
                 source = (reasoning[-2400:] + "\n" + structured[-800:]).strip()
-                if not source:
+                if summary_kind == "live" and not source:
                     return
+
                 snapshot = {
                     "task_context": {
                         "id": task.get("id"),
@@ -3225,84 +3776,140 @@ class CaptureAgentService:
                         "summary": node.get("summary"),
                         "status": node.get("status"),
                         "progress": node.get("progress"),
-                        "phase": phase,
+                        "phase": model_phase,
+                        "started_at": node.get("started_at"),
+                        "ended_at": node.get("ended_at"),
                     },
                     "latest_reasoning": reasoning,
                     "latest_structured_output": structured,
+                    "_summary_kind": summary_kind,
+                    "_lifecycle_phase": lifecycle_phase,
                 }
+                if lifecycle_phase:
+                    self._save_task_locked(task)
         except KeyError:
             return
 
         key = (task_id, node_id)
-        signature = hashlib.sha1(source.encode("utf-8", errors="ignore")).hexdigest()
         now = time.monotonic()
+        signature_source = f"{summary_kind}\n{source}"
+        signature = hashlib.sha1(signature_source.encode("utf-8", errors="ignore")).hexdigest()
+
         with self._summary_lock:
+            last_requested = float(self._summary_last_requested.get(key) or 0.0)
+            if summary_kind == "live" and not force and now - last_requested < 1.4:
+                return
             if signature == self._summary_signatures.get(key):
                 return
-            last_requested = float(self._summary_last_requested.get(key) or 0.0)
-            if not force and now - last_requested < 1.4:
-                return
+
             self._summary_signatures[key] = signature
             self._summary_last_requested[key] = now
-            self._summary_pending[key] = snapshot
+            snapshot["_summary_signature"] = signature
+
             worker = self._summary_workers.get(key)
             if worker is not None and worker.is_alive():
+                # Coalesce aggressively: while a summary is running, keep only the
+                # newest state. The worker consumes that latest snapshot next.
+                self._summary_pending[key] = snapshot
                 return
+
+            # The first snapshot is passed directly to the worker so the one-off
+            # node-start summary cannot be overwritten by an immediate stream update.
             worker = threading.Thread(
                 target=self._status_summary_worker,
-                args=(key,),
+                args=(key, snapshot),
                 daemon=True,
                 name=f"capture-summary-{task_id[-5:]}-{node_id[-8:]}",
             )
             self._summary_workers[key] = worker
             worker.start()
 
-    def _status_summary_worker(self, key: tuple[str, str]) -> None:
+    def _status_summary_worker(
+        self,
+        key: tuple[str, str],
+        initial_snapshot: dict[str, Any] | None = None,
+    ) -> None:
         task_id, node_id = key
+        snapshot = initial_snapshot
         try:
             while True:
-                with self._summary_lock:
-                    snapshot = self._summary_pending.pop(key, None)
+                if snapshot is None:
+                    with self._summary_lock:
+                        snapshot = self._summary_pending.pop(key, None)
                 if snapshot is None:
                     return
+
+                summary_kind = str(snapshot.pop("_summary_kind", "live") or "live")
+                lifecycle_phase = str(snapshot.pop("_lifecycle_phase", "") or "")
+                snapshot_signature = str(snapshot.pop("_summary_signature", "") or "")
+
                 try:
                     summary = self.planner.summarize_live_status(**snapshot)
                 except Exception as exc:
                     with self._summary_lock:
-                        self._summary_signatures.pop(key, None)
+                        if snapshot_signature and self._summary_signatures.get(key) == snapshot_signature:
+                            self._summary_signatures.pop(key, None)
                     with self._lock:
                         try:
                             task = self._load_task_locked(task_id)
                             node = self._node(task, node_id)
+                            label = (
+                                f"节点{lifecycle_phase}摘要"
+                                if lifecycle_phase
+                                else "实时状态摘要"
+                            )
                             node.setdefault("logs", []).append(
-                                self._log_entry(f"实时状态摘要生成失败：{exc}", "warning")
+                                self._log_entry(f"{label}生成失败：{exc}", "warning")
                             )
                             self._save_task_locked(task)
                         except KeyError:
                             pass
+                    snapshot = None
                     continue
-                if not summary:
-                    continue
-                with self._lock:
-                    try:
-                        task = self._load_task_locked(task_id)
-                        node = self._node(task, node_id)
-                    except KeyError:
-                        return
-                    outputs = node.setdefault("outputs", {})
-                    if str(outputs.get("llm_status_summary") or "") == summary:
-                        continue
-                    outputs["llm_status_summary"] = summary
-                    outputs["llm_status_summary_updated_at"] = utc_now_iso()
-                    node["updated_at"] = utc_now_iso()
-                    self._append_event_locked(
-                        task,
-                        "llm_status_summary",
-                        summary,
-                        node_id=node_id,
-                        data={"summary": summary},
-                    )
-                    self._save_task_locked(task)
+
+                if summary:
+                    with self._lock:
+                        try:
+                            task = self._load_task_locked(task_id)
+                            node = self._node(task, node_id)
+                        except KeyError:
+                            return
+                        outputs = node.setdefault("outputs", {})
+
+                        if lifecycle_phase:
+                            outputs[f"llm_status_summary_{lifecycle_phase}"] = summary
+                            generated = [
+                                str(item)
+                                for item in outputs.get("llm_status_summary_generated_phases") or []
+                            ]
+                            if lifecycle_phase not in generated:
+                                generated.append(lifecycle_phase)
+                            outputs["llm_status_summary_generated_phases"] = generated
+
+                        # A fast node may terminate while its start/live summary is
+                        # still being generated. Never let a delayed non-terminal
+                        # response overwrite the node's final summary.
+                        is_terminal = str(node.get("status") or "") in TERMINAL_NODE_STATES
+                        visible_summary = summary_kind == "end" or not is_terminal
+                        if visible_summary and str(outputs.get("llm_status_summary") or "") != summary:
+                            outputs["llm_status_summary"] = summary
+                            outputs["llm_status_summary_updated_at"] = utc_now_iso()
+                            outputs["llm_status_summary_phase"] = lifecycle_phase or "live"
+                            node["updated_at"] = utc_now_iso()
+                            self._append_event_locked(
+                                task,
+                                "llm_status_summary",
+                                summary,
+                                node_id=node_id,
+                                data={
+                                    "summary": summary,
+                                    "phase": lifecycle_phase or "live",
+                                    "source_phase": snapshot.get("node_context", {}).get("phase"),
+                                },
+                            )
+                        self._save_task_locked(task)
+
+                snapshot = None
         finally:
             with self._summary_lock:
                 self._summary_workers.pop(key, None)
@@ -3318,7 +3925,7 @@ class CaptureAgentService:
 
     @staticmethod
     def _execution_nodes_in_order(task: dict[str, Any]) -> list[dict[str, Any]]:
-        bootstrap_ids = {"template_analysis", "instruction_analysis", "plan_generation", "approval"}
+        bootstrap_ids = set(CaptureAgentService._bootstrap_node_ids())
         return [node for node in task.get("nodes", []) if node.get("id") not in bootstrap_ids]
 
     @staticmethod
@@ -3403,6 +4010,7 @@ class CaptureAgentService:
             task["progress"] = self._task_progress(task)
             self._append_event_locked(task, "node_completed", summary, node_id=node_id, data={"progress": task["progress"]})
             self._save_task_locked(task)
+        self._schedule_status_summary(task_id, node_id, force=True, phase="node_terminal")
 
     def _begin_node_locked(self, task: dict[str, Any], node: dict[str, Any], message: str) -> None:
         node["status"] = "in_progress"
@@ -3414,7 +4022,7 @@ class CaptureAgentService:
         node["inputs"] = self._node_inputs(task, node["id"])
         node["logs"].append(self._log_entry(message, "info"))
         task["current_node_id"] = node["id"]
-        task["status"] = "planning" if node["id"] in {"template_analysis", "instruction_analysis", "plan_generation"} else "running"
+        task["status"] = "planning" if node["id"] in {"template_analysis", "device_discovery", "device_selection", "instruction_analysis", "plan_generation"} else "running"
         self._append_event_locked(task, "node_started", message, node_id=node["id"])
 
     @staticmethod
@@ -3449,6 +4057,7 @@ class CaptureAgentService:
             "execute_usrp_task_code",
             "run_autonomous_usrp_task",
             "execute_spectrum_collection",
+            "collect_wifi_bluetooth_probe_evidence",
         }
         return any(
             (node.get("tool_name") or node.get("allowed_tool")) in device_tools
@@ -3646,6 +4255,9 @@ class CaptureAgentService:
             "reasoning_mode": _normalize_reasoning_mode(payload.get("reasoning_mode")),
             "selected_usrp_devices": payload.get("selected_usrp_devices", []),
             "selected_probe_devices": payload.get("selected_probe_devices", []),
+            "available_devices": payload.get("available_devices", {}),
+            "device_selection": payload.get("device_selection", {}),
+            "probe_evidence_sets": payload.get("probe_evidence_sets", []),
             "probe_assistance": payload.get("probe_assistance", {}),
             "template_ids": payload.get("template_ids", []),
             "templates": payload.get("templates", []),
@@ -3674,6 +4286,46 @@ class CaptureAgentService:
             if str(artifact.get("file_name") or "").lower().endswith(".npz"):
                 artifact["spectrum_url"] = f"{base_url}/spectrum"
         return task
+
+    @staticmethod
+    def _device_collection_snapshot(task: dict[str, Any]) -> dict[str, Any]:
+        selected_types = list((task.get("device_selection") or {}).get("selected_device_types") or [])
+        nodes_by_id = {str(node.get("id") or ""): node for node in task.get("nodes", [])}
+        snapshot: dict[str, Any] = {"selected_device_types": selected_types}
+        if "usrp" in selected_types:
+            snapshot["usrp"] = {
+                "selected_devices": [
+                    {
+                        "device_id": item.get("device_id") or item.get("dev_id") or item.get("id"),
+                        "name": item.get("name") or item.get("label") or item.get("product"),
+                    }
+                    for item in list(task.get("selected_usrp_devices") or [])
+                ],
+                "nodes": [
+                    {"id": node_id, "title": nodes_by_id.get(node_id, {}).get("title"), "status": nodes_by_id.get(node_id, {}).get("status"), "summary": nodes_by_id.get(node_id, {}).get("summary")}
+                    for node_id in ("device_scan", "collection_execution", "output_file_check", "execution_summary")
+                    if node_id in nodes_by_id
+                ],
+                "execution_summary": dict(task.get("execution_summary") or {}),
+            }
+        if "wifi_bluetooth_probe" in selected_types:
+            probe_node = nodes_by_id.get("wifi_bluetooth_probe_collection", {})
+            snapshot["wifi_bluetooth_probe"] = {
+                "selected_devices": [
+                    {
+                        "probe_id": item.get("probe_id") or item.get("device_id") or item.get("id"),
+                        "name": item.get("name") or item.get("label"),
+                    }
+                    for item in list(task.get("selected_probe_devices") or [])
+                ],
+                "node": {
+                    "status": probe_node.get("status"),
+                    "summary": probe_node.get("summary"),
+                },
+                "evidence_sets": list(task.get("probe_evidence_sets") or []),
+                "latest_summary": task.get("latest_probe_summary") or "",
+            }
+        return snapshot
 
     @staticmethod
     def _render_markdown_report(task: dict[str, Any]) -> str:
@@ -3715,6 +4367,11 @@ class CaptureAgentService:
             lines.extend(["", "执行日志："])
             lines.extend([f"- {entry.get('timestamp')} [{entry.get('level')}] {entry.get('message')}" for entry in node.get("logs", [])])
             lines.append("")
+        lines.extend(["## 设备选择与执行策略", "", "```json", json.dumps(task.get("device_selection", {}), ensure_ascii=False, indent=2), "```", ""])
+        lines.extend(["## 各设备采集情况", "", "本节按本任务实际选中的设备汇总采集状态、执行摘要与证据索引。", "", "```json", json.dumps(CaptureAgentService._device_collection_snapshot(task), ensure_ascii=False, indent=2), "```", ""])
         lines.extend(["## 执行结果", "", "```json", json.dumps(task.get("execution_result", {}), ensure_ascii=False, indent=2), "```", ""])
-        lines.extend(["## WiFi/蓝牙探针辅助证据", "", "```json", json.dumps(task.get("probe_assistance", {}), ensure_ascii=False, indent=2), "```", ""])
+        lines.extend(["## WiFi/蓝牙探针证据集", "", "```json", json.dumps(task.get("probe_evidence_sets", []), ensure_ascii=False, indent=2), "```", ""])
+        legacy_aux = task.get("probe_assistance") or {}
+        if legacy_aux.get("enabled"):
+            lines.extend(["## 兼容旧任务：探针辅助证据", "", "```json", json.dumps(legacy_aux, ensure_ascii=False, indent=2), "```", ""])
         return "\n".join(lines)

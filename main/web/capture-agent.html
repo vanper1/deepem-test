@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DeepEM 采集智能体</title>
   <link rel="stylesheet" href="/static/styles.css?v=probe-agent-20260729-detail">
-  <link rel="stylesheet" href="/static/capture-agent.css?v=probe-agent-20260729-detail">
+  <link rel="stylesheet" href="/static/capture-agent.css?v=adaptive-devices-0907-r2">
 </head>
 <body class="deem-body capture-page-body">
 <div class="deem-app capture-agent-app">
@@ -21,8 +21,9 @@
     </div>
 
     <div class="deem-header-actions">
-      <span id="modelModeBadge" class="capture-mode-badge deep">深度思考模式</span>
+      <button id="modelModeBadge" class="capture-mode-badge fast" type="button" title="点击切换快速/深度思考模式；新建任务时生效" aria-label="切换模型思考模式">快速模式</button>
       <button id="probeAssistBtn" class="deem-btn ghost hidden" type="button">WiFi/蓝牙辅助证据</button>
+      <button id="evidenceChainBtn" class="deem-btn ghost" type="button" disabled>设备—证据链</button>
       <button id="baselineManagerBtn" class="deem-btn ghost" type="button">基线管理</button>
       <button id="approveTaskBtn" class="deem-btn primary" type="button" disabled>批准执行</button>
       <button id="cancelTaskBtn" class="deem-btn danger" type="button" disabled>停止</button>
@@ -56,7 +57,57 @@
       </div>
     </aside>
 
-    <section class="detail panel">
+    <section id="deviceWorkbench" class="device-workbench panel">
+      <div class="device-workbench-head">
+        <div>
+          <span class="eyebrow">DEVICES</span>
+          <h2>采集设备工作台</h2>
+          <p>自动探测在线设备；智能体会在规划阶段依据任务背景自行决定实际调用哪些设备。</p>
+        </div>
+        <div class="device-workbench-actions">
+          <span id="deviceQueryStatus" class="device-query-status">尚未查询</span>
+          <button id="queryDevicesBtn" class="deem-btn primary" type="button">查询可用设备</button>
+        </div>
+      </div>
+      <div id="deviceSummaryStrip" class="device-summary-strip">
+        <span><i class="device-dot unknown"></i> 等待设备探测</span>
+      </div>
+      <div id="deviceCarousel" class="device-carousel">
+        <div class="device-empty-state">
+          <div class="empty-icon">⌁</div>
+          <strong>尚未查询设备</strong>
+          <span>点击“查询可用设备”自动探测 USRP 与 WiFi/蓝牙探针。</span>
+        </div>
+      </div>
+    </section>
+
+    <aside class="thinking panel">
+      <div class="panel-title-row">
+        <div><span class="eyebrow">LIVE</span><h2>实时执行过程</h2></div>
+        <span id="connectionStatus" class="live-state">未连接</span>
+      </div>
+      <div class="live-summary-card" aria-live="polite">
+        <div class="live-summary-head">
+          <span class="thinking-orb"></span>
+          <strong id="reasoningSummaryTitle">动态思考摘要</strong>
+        </div>
+        <p id="reasoningSummary">等待模型生成当前任务摘要…</p>
+        <span id="reasoningSummaryMeta"></span>
+      </div>
+      <div id="reasoningEmpty" class="reasoning-empty compact hidden">
+        <strong>尚无详细思考过程</strong>
+      </div>
+      <details id="reasoningDetails" class="structured-output reasoning-details">
+        <summary id="reasoningDetailsTitle">查看详细思考过程</summary>
+        <pre id="reasoningStream" class="reasoning-stream">尚无详细思考过程</pre>
+      </details>
+      <details class="structured-output">
+        <summary>查看结构化输出流</summary>
+        <pre id="structuredStream">尚无输出</pre>
+      </details>
+    </aside>
+  </main>
+  <section class="detail panel legacy-node-detail-host hidden" aria-hidden="true">
       <div id="detailEmpty" class="empty">
         <div class="empty-icon">◎</div>
         <strong>尚未选择节点</strong>
@@ -140,32 +191,7 @@
       </div>
     </section>
 
-    <aside class="thinking panel">
-      <div class="panel-title-row">
-        <div><span class="eyebrow">LIVE</span><h2>实时执行过程</h2></div>
-        <span id="connectionStatus" class="live-state">未连接</span>
-      </div>
-      <div class="live-summary-card" aria-live="polite">
-        <div class="live-summary-head">
-          <span class="thinking-orb"></span>
-          <strong id="reasoningSummaryTitle">动态思考摘要</strong>
-        </div>
-        <p id="reasoningSummary">等待模型生成当前任务摘要…</p>
-        <span id="reasoningSummaryMeta"></span>
-      </div>
-      <div id="reasoningEmpty" class="reasoning-empty compact hidden">
-        <strong>尚无详细思考过程</strong>
-      </div>
-      <details id="reasoningDetails" class="structured-output reasoning-details">
-        <summary id="reasoningDetailsTitle">查看详细思考过程</summary>
-        <pre id="reasoningStream" class="reasoning-stream">尚无详细思考过程</pre>
-      </details>
-      <details class="structured-output">
-        <summary>查看结构化输出流</summary>
-        <pre id="structuredStream">尚无输出</pre>
-      </details>
-    </aside>
-  </main>
+
 
   <footer class="composer panel">
     <div class="composer-left">
@@ -209,7 +235,7 @@
           <div id="approvalParamGrid" class="param-grid"></div>
         </article>
         <article>
-          <h3>固定工具流程</h3>
+          <h3>自适应设备执行流程</h3>
           <div id="approvalFlow" class="arrow-flow"></div>
         </article>
       </div>
@@ -390,9 +416,30 @@
     </section>
   </div>
 
+  <div id="deviceHistoryModal" class="modal-backdrop nested-modal-backdrop hidden">
+    <section class="device-history-modal" role="dialog" aria-modal="true" aria-labelledby="deviceHistoryTitle">
+      <div class="modal-head">
+        <div><span class="eyebrow">DEVICE CALL</span><h2 id="deviceHistoryTitle">设备调用详情</h2><p id="deviceHistorySubtitle"></p></div>
+        <button id="closeDeviceHistoryBtn" class="modal-close-btn" type="button" aria-label="关闭设备调用详情">×</button>
+      </div>
+      <div id="deviceHistoryBody" class="device-history-body"></div>
+    </section>
+  </div>
+
+  <div id="evidenceChainModal" class="modal-backdrop nested-modal-backdrop hidden">
+    <section class="evidence-chain-modal" role="dialog" aria-modal="true" aria-labelledby="evidenceChainTitle">
+      <div class="modal-head">
+        <div><span class="eyebrow">DEVICE → EVIDENCE</span><h2 id="evidenceChainTitle">设备—证据链</h2><p id="evidenceChainSubtitle"></p></div>
+        <button id="closeEvidenceChainBtn" class="modal-close-btn" type="button" aria-label="关闭设备证据链">×</button>
+      </div>
+      <div id="evidenceChainPolicy" class="evidence-chain-policy"></div>
+      <div id="evidenceChainBody" class="evidence-chain-body"></div>
+    </section>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
   <div class="deem-footer-org"></div>
 </div>
-  <script src="/static/capture-agent.js?v=probe-agent-20260729-detail"></script>
+  <script src="/static/capture-agent.js?v=adaptive-devices-0907-r2"></script>
 </body>
 </html>

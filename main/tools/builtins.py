@@ -21,7 +21,7 @@ from deepem.tools.spectrum_baseline import (
     build_extract_baseline_spectrum_peaks_tool,
 )
 from deepem.tools.sql_tool import build_query_local_database_tool
-from deepem.tools.probe_evidence import build_collect_probe_evidence_tool
+from deepem.tools.probe_evidence import build_collect_probe_evidence_tool, build_query_probe_evidence_tool
 
 
 def _serialize_state(state) -> dict[str, object]:
@@ -321,4 +321,5 @@ def register_builtin_tools(registry: ToolRegistry) -> ToolRegistry:
     registry.register(build_extract_baseline_spectrum_peaks_tool())
     registry.register(build_compare_spectrum_with_baseline_tool())
     registry.register(build_collect_probe_evidence_tool())
+    registry.register(build_query_probe_evidence_tool())
     return registry
