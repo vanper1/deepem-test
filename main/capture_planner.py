@@ -55,13 +55,34 @@ class CaptureIntentConstraints(BaseModel):
 class CaptureIntentProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    objective: str = Field(min_length=1, max_length=1000)
-    task_summary: str = Field(min_length=1, max_length=3000)
     constraints: CaptureIntentConstraints
-    assumptions: list[str] = Field(default_factory=list, max_length=30)
-    unresolved_questions: list[str] = Field(default_factory=list, max_length=30)
-    source_trace: dict[str, str] = Field(default_factory=dict)
-    risk_notes: list[str] = Field(default_factory=list, max_length=30)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+
+DeviceType = Literal["usrp", "wifi_bluetooth_probe"]
+
+
+class CaptureDeviceSelection(BaseModel):
+    """LLM decision about which currently available acquisition devices are needed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    objective: str = Field(min_length=1, max_length=1200)
+    selected_device_types: list[DeviceType] = Field(min_length=1, max_length=2)
+    rationale: dict[str, str] = Field(default_factory=dict)
+    probe_kinds: list[Literal["wifi_ap", "wifi_client", "bluetooth"]] = Field(default_factory=list, max_length=3)
+    active_minutes: int = Field(default=30, ge=1, le=1440)
+    unavailable_requirements: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("selected_device_types")
+    @classmethod
+    def unique_device_types(cls, value: list[DeviceType]) -> list[DeviceType]:
+        result: list[DeviceType] = []
+        for item in value:
+            if item not in result:
+                result.append(item)
+        return result
 
 
 NodeKind = Literal["llm_analysis", "tool_call", "llm_verification", "decision"]
@@ -142,9 +163,34 @@ class CaptureLLMPlanner:
     def __init__(self, llm_client: Any) -> None:
         self.llm_client = llm_client
 
+    USRP_PARAMETER_RANGES: dict[str, Any] = {
+        "freq_start_mhz": {"min": 45.0, "max": 6000.0},
+        "freq_stop_mhz": {"min": 45.0, "max": 6000.0},
+        "freq_step_mhz": {"min": 0.001, "max": 1000.0},
+        "sample_rate": {"min": 0.03125, "max": 16.0},
+        "bandwidth": {"min": 0.2, "max": 16.0},
+        "gain": {"min": 0.0, "max": 70.0},
+        "dwell_time_sec": {"min": 0.01, "max": 60.0},
+        "repeat_count": {"min": 1, "max": 3},
+        "expected_fft_frames_per_capture": {"min": 1, "max": 10000},
+        "antenna": ["TX/RX", "RX2"],
+    }
+    USRP_PARAMETER_RELATIONSHIPS: list[str] = [
+        "freq_start_mhz 必须小于或等于 freq_stop_mhz",
+        "bandwidth 必须小于或等于 sample_rate",
+    ]
+
+    @classmethod
+    def usrp_parameter_context(cls) -> dict[str, Any]:
+        """Return a fresh copy of the physical USRP parameter limits for every planning request."""
+        return {
+            "ranges": json.loads(json.dumps(cls.USRP_PARAMETER_RANGES, ensure_ascii=False)),
+            "relationships": list(cls.USRP_PARAMETER_RELATIONSHIPS),
+        }
+
     @staticmethod
     def normalize_reasoning_mode(value: str | None) -> str:
-        return "fast" if str(value or "").strip().lower() == "fast" else "deep"
+        return "deep" if str(value or "").strip().lower() == "deep" else "fast"
 
     @classmethod
     def generation_options_for_mode(cls, reasoning_mode: str | None, *, temperature: float = 0.1) -> dict[str, Any]:
@@ -191,6 +237,54 @@ class CaptureLLMPlanner:
                 "DEEPEM_LLM_MODEL 后重启服务；本功能不会回退到本地固定计划。"
             )
 
+    def select_devices(
+        self,
+        *,
+        instruction: str,
+        template_markdown: str,
+        available_devices: dict[str, Any],
+        reasoning_mode: str = "fast",
+        stream_handler: PlannerStreamHandler | None = None,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        self.ensure_available()
+        system = (
+            "你是 DeepEM 采集智能体的设备规划器。先依据任务背景和当前可用设备清单决定真正需要调用哪些设备，"
+            "USRP 适合原始 IQ、频谱、指定频段/频率、射频能量与后续频谱分析；"
+            "一般任务时，都应考虑wifi_bluetooth_probe；"
+            "只有当问题明显偏离2.4GHz频段时，此时不考虑wifi_bluetooth_probe；"
+            "probe_kinds 只在选择探针时填写需要的 wifi_ap/wifi_client/bluetooth；无法满足的需求写入 unavailable_requirements。"
+            "请在 reasoning 通道给出简洁可审计理由；最终 content 只输出符合 JSON Schema 的 JSON。"
+        )
+        proposal, raw_text = self._complete_json(
+            schema_model=CaptureDeviceSelection,
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "instruction": instruction,
+                            "template_markdown": template_markdown[:30000],
+                            "available_devices": available_devices,
+                            "output_json_schema": CaptureDeviceSelection.model_json_schema(),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            ],
+            phase="device_selection",
+            reasoning_mode=reasoning_mode,
+            stream_handler=stream_handler,
+            cancel_checker=cancel_checker,
+        )
+        return {
+            "proposal": proposal.model_dump(mode="json"),
+            "raw_model_output": raw_text,
+            "model": self.runtime_info(),
+        }
+
     def analyze_intent(
         self,
         *,
@@ -198,25 +292,35 @@ class CaptureLLMPlanner:
         template_markdown: str,
         parameter_context: dict[str, Any],
         previous_analysis: dict[str, Any] | None = None,
-        reasoning_mode: str = "deep",
+        reasoning_mode: str = "fast",
         stream_handler: PlannerStreamHandler | None = None,
         cancel_checker: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         self.ensure_available()
+        usrp_parameter_context = self.usrp_parameter_context()
+        parameter_context = dict(parameter_context or {})
+        # Always attach the real device limits to the same user payload that asks
+        # the model to generate USRP parameters.  Keeping the limits only in the
+        # system prompt proved too easy to lose across provider/model variations.
+        parameter_context["usrp_device_parameter_ranges"] = usrp_parameter_context["ranges"]
+        parameter_context["usrp_parameter_relationships"] = usrp_parameter_context["relationships"]
+        ranges_text = json.dumps(usrp_parameter_context["ranges"], ensure_ascii=False, separators=(",", ":"))
         system = (
-            "你是 DeepEM 生产级采集智能体的意图分析器。依据用户指令与 DOCX 模板形成结构化意图。"
-            "严禁使用任何默认采集参数、固定预设或无依据的通用参数组。参数解析优先级必须是："
-            "用户明确指定或强制指定 > 模板明确指定 > 根据当前任务意图主动设计。"
-            "凡是用户或模板已经指定的字段，必须原样遵循，不得重新设计、替换或静默调整；"
-            "只有两者都没有指定的字段，才允许结合任务目标、场景、覆盖范围、精度、耗时与风险设计合适值。"
-            "所有采集字段都必须给出非 null 的最终值；每个字段必须在 source_trace 中标明来源为 user_instruction、"
-            "template 或 llm_intent_design。由模型设计的字段还要在 assumptions 中简要说明选择依据。"
-            "频率、采样率、带宽统一为 MHz，时间统一为秒。不要臆造模板内容，也不要套用全频段、固定步长、"
-            "固定重复次数等惯用组合。请在 reasoning 通道输出简洁、可审计的意图分析摘要；"
-            "所有生成参数必须满足以下允许范围：{\"freq_start_mhz\":{\"min\":45.0,\"max\":6000.0},\"freq_stop_mhz\":{\"min\":45.0,\"max\":6000.0},\"freq_step_mhz\":{\"min\":0.001,\"max\":1000.0},\"sample_rate\":{\"min\":0.03125,\"max\":16.0},\"bandwidth\":{\"min\":0.2,\"max\":16.0},\"gain\":{\"min\":0.0,\"max\":70.0},\"dwell_time_sec\":{\"min\":0.01,\"max\":60.0},\"repeat_count\":{\"min\":1,\"max\":3},\"expected_fft_frames_per_capture\":{\"min\":1,\"max\":10000},\"antenna\":[\"TX/RX\",\"RX2\"]}。"
-            "参数关系约束：- freq_start_mhz 必须小于或等于 freq_stop_mhz。 - bandwidth 必须小于或等于 sample_rate。 "       
-            "最终 content 只输出符合 JSON Schema 的 JSON 对象，不输出 Markdown 或额外解释。"
+            "你只负责生成需要用户确认的 USRP 采集参数。"
+            "参数优先级：用户明确指定 > 模板明确指定 > 模型根据当前任务意图补全。"
+            "用户或模板已经明确的参数必须原样保留，不得修改。"
+            "只有未明确的参数才允许根据任务意图补全。"
+            "所有采集参数都必须给出非 null 的最终值。"
+            "频率、采样率、带宽统一使用 MHz，时间统一使用秒。"
+            f"所有生成参数必须满足以下设备允许范围：{ranges_text}。"
+            "参数关系约束：freq_start_mhz 必须小于或等于 freq_stop_mhz；"
+            "bandwidth 必须小于或等于 sample_rate。"
+            "只输出 constraints 和 reason。"
+            "reason 只需简短说明，说明参数为什么这样设置，不要展开分析。"
+            "不要生成目标、任务摘要、假设、未决问题、风险、来源追踪或其他内容。"
+            "最终只输出符合 JSON Schema 的 JSON 对象，不输出 Markdown 或额外解释。"
         )
+
         proposal, raw_text = self._complete_json(
             schema_model=CaptureIntentProposal,
             messages=[
@@ -228,6 +332,8 @@ class CaptureLLMPlanner:
                             "instruction": instruction,
                             "template_markdown": template_markdown[:60000],
                             "parameter_resolution_context": parameter_context,
+                            "usrp_device_parameter_ranges": usrp_parameter_context["ranges"],
+                            "usrp_parameter_relationships": usrp_parameter_context["relationships"],
                             "previous_analysis_for_revision": previous_analysis or {},
                             "output_json_schema": CaptureIntentProposal.model_json_schema(),
                         },
@@ -257,7 +363,7 @@ class CaptureLLMPlanner:
         tool_catalog: dict[str, dict[str, Any]],
         plan_version: int,
         previous_plan: dict[str, Any] | None = None,
-        reasoning_mode: str = "deep",
+        reasoning_mode: str = "fast",
         stream_handler: PlannerStreamHandler | None = None,
         cancel_checker: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
@@ -327,7 +433,7 @@ class CaptureLLMPlanner:
         task_context: dict[str, Any],
         node: dict[str, Any],
         dependency_outputs: dict[str, Any],
-        reasoning_mode: str = "deep",
+        reasoning_mode: str = "fast",
         stream_handler: PlannerStreamHandler | None = None,
         cancel_checker: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
@@ -375,22 +481,44 @@ class CaptureLLMPlanner:
         latest_reasoning: str,
         latest_structured_output: str = "",
     ) -> str:
-        """Generate one short, task-specific Chinese status using the current LLM.
-
-        This deliberately reuses the configured planner model.  Thinking is disabled
-        for the summarizer, temperature is kept very low, and output length is
-        tightly capped so no additional service is required.
-        """
+        """Generate one short lifecycle or live status summary with the current LLM."""
         self.ensure_available()
+        phase = str(node_context.get("phase") or "").strip().lower()
+        is_terminal = phase in {"node_terminal", "completed", "failed", "cancelled"}
+        is_start = phase in {"node_started", "start"}
+
+        if is_terminal:
+            phase_instruction = (
+                "当前节点已经结束。请生成这个节点的最终摘要，概括已完成动作、关键结果或失败/取消原因。"
+            )
+            length_instruction = "输出 1 句话，建议 18 到 60 个汉字"
+            max_tokens = 100
+            max_chars = 100
+        elif is_start:
+            phase_instruction = (
+                "当前节点刚开始执行。请生成这个节点此刻的状态概述，说明正在做什么以及当前目标。"
+            )
+            length_instruction = "输出 1 句话，建议 18 到 60 个汉字"
+            max_tokens = 100
+            max_chars = 100
+        else:
+            phase_instruction = (
+                "当前节点正在执行。请根据最新可见 reasoning/content 的真实变化，"
+                "生成一条随进展变化的中文进行时状态；不要复述上一条状态。"
+            )
+            length_instruction = "长度 10 到 32 个汉字，最多一行"
+            max_tokens = 40
+            max_chars = 48
+
         response = self.llm_client.complete(
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "你是 DeepEM 采集智能体的实时状态摘要器。根据给出的真实任务上下文、当前节点和最新模型思考片段，如：已识别采集目标，正在检查设备是否支持对应带宽。"
-                        "概括当前最重要的分析发现、判断重点或处理进展。如：当前重点是确定采集频段。"
-                        "展示模型的思考推理过程，让用户感知到当前情况。如：用户希望采集 WiFi 信号，但没有明确频段，需要结合模板推断。"
-                        "要简短，不要引号、序号、Markdown、句号或解释。"
+                        "你是 DeepEM 采集智能体的摘要概述器。只基于提供的真实任务、节点状态和可见输出生成简洁中文概述，"
+                        "不要展开隐藏推理过程，不得虚构尚未发生的动作、结果、设备状态或证据。"
+                        f"{phase_instruction}"
+                        f"{length_instruction}；不要引号、序号、Markdown、句号或解释，也不要在末尾添加省略号。"
                     ),
                 },
                 {
@@ -412,7 +540,7 @@ class CaptureLLMPlanner:
             generation_options={
                 "temperature": 0.05,
                 "top_p": 0.2,
-                "max_tokens": 100,
+                "max_tokens": max_tokens,
                 "enable_thinking": False,
                 "preserve_thinking": False,
             },
@@ -424,14 +552,14 @@ class CaptureLLMPlanner:
             text = str(getattr(response, "reasoning", "") or "").strip()
         text = re.sub(r"^[\s\-—–•*#>\d.、）)]+", "", text)
         text = text.splitlines()[0].strip(" \t\r\n\"'“”‘’。；;！!") if text else ""
-        return text[:100]
+        return text[:max_chars]
 
     def summarize_probe_evidence(
         self,
         *,
         task_context: dict[str, Any],
         evidence: dict[str, Any],
-        reasoning_mode: str = "deep",
+        reasoning_mode: str = "fast",
         stream_handler: PlannerStreamHandler | None = None,
         cancel_checker: Callable[[], bool] | None = None,
     ) -> str:
@@ -750,7 +878,14 @@ class CaptureLLMPlanner:
                 "planner_origin": node.get("planner_origin"),
             }
             for node in nodes
-            if node.get("id") not in {"template_analysis", "instruction_analysis", "plan_generation", "approval"}
+            if node.get("id") not in {
+                "template_analysis",
+                "device_discovery",
+                "device_selection",
+                "instruction_analysis",
+                "plan_generation",
+                "approval",
+            }
         ]
         contract = {
             "fingerprint_schema": "deepem-capture-freeform-plan-v4",
@@ -769,7 +904,7 @@ class CaptureLLMPlanner:
         schema_model: type[BaseModel],
         messages: list[dict[str, Any]],
         phase: str,
-        reasoning_mode: str = "deep",
+        reasoning_mode: str = "fast",
         stream_handler: PlannerStreamHandler | None = None,
         cancel_checker: Callable[[], bool] | None = None,
     ) -> tuple[BaseModel, str]:

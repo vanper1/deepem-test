@@ -2,13 +2,13 @@
 
 ```bash
 # 1) 进入项目目录
-cd /home/deepem/DeepEM_main
+cd /home/deepem/DeepEM_main2
 source .venv/bin/activate
 export DEEPEM_LLM_API_KEY="null"
 export DEEPEM_LLM_BASE_URL="http://localhost:6000/v1"
 export DEEPEM_LLM_MODEL="qwen36_35B_A3B"
 export DEEPEM_USRP_BASE_URL="http://127.0.0.1:8901"
-python -m uvicorn main.server:app --host 0.0.0.0 --port 8141
+python -m uvicorn main.server:app --host 0.0.0.0 --port 8146
 
 
 cd /home/deepem/DeepEM_main
